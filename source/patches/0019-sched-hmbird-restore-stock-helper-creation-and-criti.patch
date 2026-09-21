@@ -1,0 +1,39 @@
+From f7c424de1cddf04ddd8097da54c1142bae22982c Mon Sep 17 00:00:00 2001
+From: shandongtlb <40312509+shandongtlb@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 10:15:30 +0000
+Subject: [PATCH 19/22] sched/hmbird: restore stock helper creation and
+ critical CPU hint
+
+Match the supplied stock Image worker-creation branch: convert ERR_PTR to NULL before sched_set_fifo so the caller reaches its existing -ENOMEM cleanup. After successful publication, initialize the helper task critical_affinity_cpu to nr_cpu_ids - 1.
+
+Evidence: stock Image SHA256 0b4b3aadd775009d88f39d0738ee7fa1a8a053444f668c2a762d0ea31f86e6a5, hmbird_ctrl offsets 0x119ef4-0x119f04 and 0x119fa0-0x119fd4. Preserve task-pointer guard, late state check, QoS and hotplug cleanup behavior; no layout or config changes.
+---
+ kernel/sched/hmbird/hmbird.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/sched/hmbird/hmbird.c b/kernel/sched/hmbird/hmbird.c
+index fe4a5df3f..b54c94c8b 100644
+--- a/kernel/sched/hmbird/hmbird.c
++++ b/kernel/sched/hmbird/hmbird.c
+@@ -4054,8 +4054,9 @@ static struct kthread_worker *hmbird_create_rt_helper(const char *name)
+ 	struct kthread_worker *helper;
+ 
+ 	helper = kthread_create_worker(KTW_FREEZABLE, name);
+-	if (helper)
+-		sched_set_fifo(helper->task);
++	if (IS_ERR(helper))
++		return NULL;
++	sched_set_fifo(helper->task);
+ 	return helper;
+ }
+ 
+@@ -4113,6 +4114,9 @@ static int hmbird_ops_enable(void *unused)
+ 			ret = -ENOMEM;
+ 			goto err_unlock;
+ 		}
++		if (hmbird_ops_helper->task)
++			get_hmbird_ts(hmbird_ops_helper->task)->critical_affinity_cpu =
++				nr_cpu_ids - 1;
+ 	}
+ 
+ 	if (hmbird_ops_enable_state() != HMBIRD_OPS_DISABLED) {

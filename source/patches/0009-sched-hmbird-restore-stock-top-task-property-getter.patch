@@ -1,0 +1,27 @@
+From d250a3d1c8ca2de083b9d28a7b58cfcd5c1314c2 Mon Sep 17 00:00:00 2001
+From: shandongtlb <40312509+shandongtlb@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 18:21:36 +0000
+Subject: [PATCH 09/22] sched/hmbird: restore stock top-task property getter
+
+Return zero when the HMBIRD entity is absent, matching the repeated stock guards in preempt, refill, pick-next and put-prev. Leave other accessors unchanged.
+---
+ include/linux/sched.h | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 8c7cfec56..dee14a867 100755
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1935,7 +1935,11 @@ static inline bool task_is_top_task(struct task_struct *p)
+ 
+ static inline int get_top_task_prop(struct task_struct *p)
+ {
+-	return get_hmbird_ts(p)->top_task_prop;
++	struct hmbird_entity *entity = get_hmbird_ts(p);
++
++	if (entity)
++		return entity->top_task_prop;
++	return 0;
+ }
+ 
+ static inline int set_top_task_prop(struct task_struct *p, u64 set, u64 clear)

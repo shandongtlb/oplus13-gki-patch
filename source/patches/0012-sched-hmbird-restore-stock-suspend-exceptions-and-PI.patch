@@ -1,0 +1,65 @@
+From 6a5ff5791f301638f1b37eaf17a0238746518e0e Mon Sep 17 00:00:00 2001
+From: shandongtlb <40312509+shandongtlb@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 18:21:37 +0000
+Subject: [PATCH 12/22] sched/hmbird: restore stock suspend exceptions and PID
+ capture
+
+Recover suspend/autosuspend exceptions and the little-affinity check with stock ordering. Save the autosuspend PID in the existing enable traversal, preserving the earlier SystemUI rejection and observed lack of reset.
+---
+ kernel/sched/hmbird/hmbird.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/sched/hmbird/hmbird.c b/kernel/sched/hmbird/hmbird.c
+index f055c3b0e..be806ce1d 100644
+--- a/kernel/sched/hmbird/hmbird.c
++++ b/kernel/sched/hmbird/hmbird.c
+@@ -38,6 +38,8 @@ enum hmbird_ops_enable_state {
+ 	HMBIRD_OPS_DISABLED,
+ };
+ 
++static int scx_autosuspend_pid = -1;
++
+ #define HMBIRD_MAX_CLUSTERS 5
+ 
+ struct hmbird_sched_cluster {
+@@ -2557,6 +2559,8 @@ static int check_misfit_task_on_little(struct task_struct *p, struct rq *rq,
+ 		return false;
+ 	if (p->pid == scx_systemui_pid)
+ 		return true;
++	if ((p->flags & PF_SUSPEND_TASK) || p->pid == scx_autosuspend_pid)
++		return false;
+ 
+ 	gen_cluster_ctx(&ctx, BIG);
+ 	dsq_misfit = (dsq_int >= SCHED_PROP_DEADLINE_LEVEL1 &&
+@@ -2567,6 +2571,8 @@ static int check_misfit_task_on_little(struct task_struct *p, struct rq *rq,
+ #endif
+ 	if (!dsq_misfit)
+ 		return false;
++	if (!cpumask_intersects(p->cpus_ptr, iso_masks.little))
++		return true;
+ 
+ 	if (p) {
+ 		if (slim_walt_ctrl)
+@@ -4071,10 +4077,12 @@ static inline void set_audio_thread_sched_prop(struct task_struct *p)
+ }
+ 
+ int scx_systemui_pid = -1;
+-void set_systemui_thread_pid(struct task_struct *p)
++void save_special_thread_pid(struct task_struct *p)
+ {
+ 	if ((strcmp(p->comm, "ndroid.systemui") == 0) && (p->pid == p->tgid))
+ 		scx_systemui_pid = p->pid;
++	else if (strcmp(p->comm, "autosuspend") == 0)
++		scx_autosuspend_pid = p->pid;
+ }
+ 
+ static int hmbird_ops_enable(void *unused)
+@@ -4199,7 +4207,7 @@ static int hmbird_ops_enable(void *unused)
+ 			struct rq *rq = task_rq(p);
+ 
+ 			set_audio_thread_sched_prop(p);
+-			set_systemui_thread_pid(p);
++			save_special_thread_pid(p);
+ 			update_rq_clock(rq);
+ 
+ 			SCHED_CHANGE_BLOCK(rq, p, DEQUEUE_SAVE | DEQUEUE_MOVE |

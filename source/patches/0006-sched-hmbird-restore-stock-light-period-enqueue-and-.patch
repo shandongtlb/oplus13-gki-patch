@@ -1,0 +1,101 @@
+From ede558a235a8b5b0da1833460a88024fad3c4d24 Mon Sep 17 00:00:00 2001
+From: shandongtlb <40312509+shandongtlb@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 17:41:16 +0000
+Subject: [PATCH 06/22] sched/hmbird: restore stock light period enqueue and
+ preemption rules
+
+Restore the signed light_preiod_thres proc scalar and the util-based per-CPU RT/light-period predicate used by enqueue and wakeup preemption. Preserve stock spelling, util source and strict threshold behavior.
+
+Validated by candidate helper versus actual stock ARM64 fragments, including affinity, RT, deadline level and signed threshold boundaries; selected ARM64 object compilation passes.
+---
+ kernel/sched/hmbird/hmbird.c            | 24 ++++++++++++++++++++----
+ kernel/sched/hmbird/hmbird_sched.h      |  1 +
+ kernel/sched/hmbird/hmbird_sched_proc.c |  6 ++++++
+ 3 files changed, 27 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/sched/hmbird/hmbird.c b/kernel/sched/hmbird/hmbird.c
+index f8a17a328..2a64686d6 100644
+--- a/kernel/sched/hmbird/hmbird.c
++++ b/kernel/sched/hmbird/hmbird.c
+@@ -678,9 +678,22 @@ static struct cgroup *cgroup_ancestor_l1(struct cgroup *cgrp)
+ 
+ #define PCP_IDX_BIT    (1 << 31)
+ 
+-static bool is_pcp_rt(struct task_struct *p)
++static bool is_pcp_rt_or_light_period(struct task_struct *p)
+ {
+-	return rt_prio(p->prio) && (p->nr_cpus_allowed == 1);
++	int sp_dl;
++	u64 util = 0;
++
++	if (slim_walt_ctrl)
++		slim_get_task_util(p, &util);
++	else
++		util = get_hmbird_ts(p)->demand_scaled;
++	sp_dl = get_hmbird_ts(p)->sched_prop & SCHED_PROP_DEADLINE_MASK;
++
++	return p->nr_cpus_allowed == 1 &&
++		(rt_prio(p->prio) ||
++		 (sp_dl >= SCHED_PROP_DEADLINE_LEVEL1 &&
++		  sp_dl <= SCHED_PROP_DEADLINE_LEVEL4 &&
++		  util < (u64)(s64)light_preiod_thres));
+ }
+ 
+ static bool is_pcp_idx(int idx)
+@@ -2099,8 +2112,8 @@ static void do_enqueue_task(struct rq *rq, struct task_struct *p, u64 enq_flags,
+ 				(unsigned long *)&get_hmbird_ts(p)->flags),
+ 				"task = %s\n", p->comm);
+ 
+-	if (is_pcp_rt(p)) {
+-		/* Enqueue percpu rt task to local directly. */
++	if (is_pcp_rt_or_light_period(p)) {
++		/* Enqueue percpu RT and light period tasks to local directly. */
+ 		/* Or cause a bug when disable dispatch. */
+ 		if (cpumask_test_cpu(cpu_of(rq), p->cpus_ptr))
+ 			enq_flags |= HMBIRD_ENQ_LOCAL;
+@@ -3418,6 +3431,9 @@ static void check_preempt_curr_hmbird(struct rq *rq, struct task_struct *p, int
+ 	int sp_dl;
+ 	struct task_struct *curr = NULL;
+ 
++	if (is_pcp_rt_or_light_period(rq->curr))
++		return;
++
+ 	switch (hmbird_preempt_policy) {
+ 	case HMBIRD_PREEMPT_POLICY_PRIO_BASED:
+ 		curr = rq->curr;
+diff --git a/kernel/sched/hmbird/hmbird_sched.h b/kernel/sched/hmbird/hmbird_sched.h
+index 76acbe968..12d5b6ae0 100644
+--- a/kernel/sched/hmbird/hmbird_sched.h
++++ b/kernel/sched/hmbird/hmbird_sched.h
+@@ -49,6 +49,7 @@ extern unsigned int highres_tick_ctrl;
+ extern unsigned int highres_tick_ctrl_dbg;
+ 
+ extern int slim_walt_ctrl;
++extern int light_preiod_thres;
+ extern int slim_walt_dump;
+ extern int slim_walt_policy;
+ extern int sched_ravg_window_frame_per_sec;
+diff --git a/kernel/sched/hmbird/hmbird_sched_proc.c b/kernel/sched/hmbird/hmbird_sched_proc.c
+index 295d45404..5469b76b5 100644
+--- a/kernel/sched/hmbird/hmbird_sched_proc.c
++++ b/kernel/sched/hmbird/hmbird_sched_proc.c
+@@ -50,6 +50,7 @@ int watchdog_enable;
+ int save_gov;
+ u64 cpu_cluster_masks;
+ int hmbird_preempt_policy;
++int light_preiod_thres = 100;
+ int cluster_separate;
+ 
+ char saved_gov[NR_CPUS][MAX_GOV_LEN];
+@@ -580,6 +581,11 @@ static int __init hmbird_proc_init(void)
+ 					hmbird_dir,
+ 					&hmbird_common_proc_ops,
+ 					&hmbird_preempt_policy);
++
++	HMBIRD_CREATE_PROC_ENTRY_DATA("light_preiod_thres", HMBIRD_PROC_PERMISSION,
++					hmbird_dir,
++					&hmbird_common_proc_ops,
++					&light_preiod_thres);
+ 	/* /proc/hmbird_sched--end */
+ 
+ 	/* mkdir /proc/hmbird_sched/slim_walt */

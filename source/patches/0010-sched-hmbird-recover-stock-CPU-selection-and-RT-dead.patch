@@ -1,0 +1,71 @@
+From bf9dd9868cce0a42394fc3cfd5bac0518b9e90a5 Mon Sep 17 00:00:00 2001
+From: shandongtlb <40312509+shandongtlb@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 18:21:37 +0000
+Subject: [PATCH 10/22] sched/hmbird: recover stock CPU selection and RT
+ deadline rules
+
+Restore the explicit RT deadline cap, periodic-task cluster affinity handling, extreme-load heavy threshold and both idle fallback predicates recovered from the supplied stock Image.
+---
+ kernel/sched/hmbird/hmbird.c | 22 ++++++++++++++++++----
+ 1 file changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/sched/hmbird/hmbird.c b/kernel/sched/hmbird/hmbird.c
+index bd7b32a44..9b9aaae1b 100644
+--- a/kernel/sched/hmbird/hmbird.c
++++ b/kernel/sched/hmbird/hmbird.c
+@@ -906,6 +906,8 @@ static int find_idx_from_task(struct task_struct *p)
+ 	sp_dl = hmbird_get_dsq_id(p);
+ 	if (sp_dl) {
+ 		idx = sp_dl;
++		if (rt_prio(p->prio) && sp_dl >= SCHED_PROP_DEADLINE_LEVEL4)
++			idx = SCHED_PROP_DEADLINE_LEVEL3;
+ 		goto done;
+ 	}
+ 
+@@ -3028,7 +3030,7 @@ static int heavy_rt_placement(struct task_struct *p, int prev)
+ 	else
+ 		util = get_hmbird_ts(p)->demand_scaled;
+ 
+-	if (util < misfit_ds)
++	if (util < (extreme_load_mode ? SCHED_CAPACITY_SCALE : misfit_ds))
+ 		return -EFAULT;
+ 
+ 	if (is_partial_enabled())
+@@ -3096,8 +3098,20 @@ static bool task_only_blongs_to_cluster(struct task_struct *p, enum cpu_type typ
+ 	struct cluster_ctx ctx;
+ 
+ 	idx = find_idx_from_task(p);
+-	if (idx < NON_PERIOD_START || idx >= MAX_GLOBAL_DSQS)
++	if (idx >= MAX_GLOBAL_DSQS)
+ 		return false;
++	if (idx < NON_PERIOD_START) {
++		struct cpumask *other;
++
++		if (type == LITTLE)
++			other = iso_masks.big;
++		else if (type == BIG)
++			other = iso_masks.little;
++		else
++			return false;
++		return !cpumask_empty(other) &&
++			!cpumask_intersects(p->cpus_ptr, other);
++	}
+ 
+ 	gen_cluster_ctx(&ctx, type);
+ 	if (idx >= ctx.lower && idx < ctx.upper)
+@@ -3176,13 +3190,13 @@ static s32 hmbird_select_cpu_dfl(struct task_struct *p, s32 prev_cpu, u64 wake_f
+ 	}
+ 
+ 	/* if the previous CPU is idle, dispatch directly to it */
+-	if (test_and_clear_cpu_idle(prev_cpu) || is_valid_cpu(prev_cpu)) {
++	if (test_and_clear_cpu_idle(prev_cpu) && is_valid_cpu(prev_cpu)) {
+ 		slim_stats_record(SELECT_CPU, 0, 0, 0);
+ 		return prev_cpu;
+ 	}
+ 
+ 	cpu = hmbird_pick_idle_cpu(cpu_possible_mask);
+-	if (is_valid_cpu(prev_cpu)) {
++	if (is_valid_cpu(cpu)) {
+ 		slim_stats_record(SELECT_CPU, 0, 0, 0);
+ 		return cpu;
+ 	}

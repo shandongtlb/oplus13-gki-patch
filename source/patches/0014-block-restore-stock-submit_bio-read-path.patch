@@ -1,0 +1,24 @@
+From fffa3cd1ccba0da7197bf590208423b9a00c995a Mon Sep 17 00:00:00 2001
+From: shandongtlb <40312509+shandongtlb@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 06:28:02 +0000
+Subject: [PATCH 14/22] block: restore stock submit_bio read path
+
+Remove the release-tree zero-length read BUG_ON, which is absent from the supplied stock Image. With the stock config and clang-r510928, submit_bio matches all 105 instruction words after resolving relocations.
+---
+ block/blk-core.c | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 1c4a5e61d..4ad61822e 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -887,9 +887,6 @@ static void bio_set_ioprio(struct bio *bio)
+ void submit_bio(struct bio *bio)
+ {
+ 	if (bio_op(bio) == REQ_OP_READ) {
+-		//#ifdef OPLUS_STORAGE_FS debug for bugid 7760993
+-		BUG_ON(!bio->bi_iter.bi_size);
+-		//#endif
+ 		task_io_account_read(bio->bi_iter.bi_size);
+ 		count_vm_events(PGPGIN, bio_sectors(bio));
+ 	} else if (bio_op(bio) == REQ_OP_WRITE) {

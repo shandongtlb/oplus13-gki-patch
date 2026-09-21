@@ -1,0 +1,77 @@
+From f906c9b462b5485de47431bc1931067353bf584e Mon Sep 17 00:00:00 2001
+From: shandongtlb <40312509+shandongtlb@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 08:26:50 +0000
+Subject: [PATCH 16/22] mm: restore stock swap-cache retry timeout hook
+
+Restore the public ACK restricted hook declaration, retry call and exports observed in stock. Add both names to the Oplus KMI list so trimming retains them. Direct target objects match stock bodies and metadata; genksyms matches both stock CRCs.
+---
+ android/abi_gki_aarch64_oplus  | 2 ++
+ drivers/android/vendor_hooks.c | 1 +
+ include/trace/hooks/mm.h       | 3 +++
+ mm/swap_state.c                | 6 ++++++
+ 4 files changed, 12 insertions(+)
+
+diff --git a/android/abi_gki_aarch64_oplus b/android/abi_gki_aarch64_oplus
+index 63af96879..39a87255e 100755
+--- a/android/abi_gki_aarch64_oplus
++++ b/android/abi_gki_aarch64_oplus
+@@ -602,3 +602,5 @@
+   __tracepoint_android_vh_lock_delay_schedule
+   __tracepoint_android_vh_lock_task_fork
+   __tracepoint_android_vh_lock_task_exit
++  __traceiter_android_rvh_read_swap_cache_async_timeout
++  __tracepoint_android_rvh_read_swap_cache_async_timeout
+diff --git a/drivers/android/vendor_hooks.c b/drivers/android/vendor_hooks.c
+index 2d64b03a1..0dba647fa 100755
+--- a/drivers/android/vendor_hooks.c
++++ b/drivers/android/vendor_hooks.c
+@@ -719,3 +719,4 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_clear_curr_lazy);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_lock_delay_schedule);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_lock_task_fork);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_lock_task_exit);
++EXPORT_TRACEPOINT_SYMBOL_GPL(android_rvh_read_swap_cache_async_timeout);
+diff --git a/include/trace/hooks/mm.h b/include/trace/hooks/mm.h
+index ef3e553d1..0d3bced0e 100755
+--- a/include/trace/hooks/mm.h
++++ b/include/trace/hooks/mm.h
+@@ -682,6 +682,9 @@ DECLARE_RESTRICTED_HOOK(android_rvh_gup_longterm_locked,
+ 		unsigned long start, unsigned long nr_pages,
+ 		struct page **pages),
+ 	TP_ARGS(rc, nr_pinned_pages, start, nr_pages, pages), 5);
++DECLARE_RESTRICTED_HOOK(android_rvh_read_swap_cache_async_timeout,
++	TP_PROTO(size_t *count, bool *skip),
++	TP_ARGS(count, skip), 2);
+ #endif /* _TRACE_HOOK_MM_H */
+ 
+ /* This part must be outside protection */
+diff --git a/mm/swap_state.c b/mm/swap_state.c
+index d12dedc52..6603533b1 100644
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@ -428,6 +428,7 @@ struct page *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
+ 	struct folio *folio;
+ 	struct page *page;
+ 	void *shadow = NULL;
++	size_t count = 0;
+ 
+ 	*new_page_allocated = false;
+ 	si = get_swap_device(entry);
+@@ -436,6 +437,7 @@ struct page *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
+ 
+ 	for (;;) {
+ 		int err;
++		bool skip = false;
+ 		/*
+ 		 * First check the swap cache.  Since this is normally
+ 		 * called after swap_cache_get_folio() failed, re-calling
+@@ -486,6 +488,10 @@ struct page *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
+ 		 * __read_swap_cache_async(), which has set SWAP_HAS_CACHE
+ 		 * in swap_map, but not yet added its page to swap cache.
+ 		 */
++		trace_android_rvh_read_swap_cache_async_timeout(&count, &skip);
++		if (skip)
++			continue;
++
+ 		schedule_timeout_uninterruptible(1);
+ 	}
+ 

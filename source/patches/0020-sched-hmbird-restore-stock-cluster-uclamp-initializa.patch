@@ -1,0 +1,25 @@
+From dc7e7928c8955f4ec9feff260d9742d5c461eb5d Mon Sep 17 00:00:00 2001
+From: shandongtlb <40312509+shandongtlb@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 10:50:52 +0000
+Subject: [PATCH 20/22] sched/hmbird: restore stock cluster uclamp
+ initialization write
+
+Initialize uclamp_min alongside id during first cluster construction. The stock Image contains five 64-bit stores covering both u32 fields; the previous candidate wrote only id after the initial memset. The actual ARM64 object now reproduces all five stores, with no other .text changes.
+
+Evidence: stock Image SHA256 0b4b3aadd775009d88f39d0738ee7fa1a8a053444f668c2a762d0ea31f86e6a5, stores at offsets 0x119d28, 0x119d4c, 0x119d70, 0x119d94, 0x119dbc. Preserve bool and out-of-range trap differences as separate audit limits; no config or layout changes.
+---
+ kernel/sched/hmbird/hmbird.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/kernel/sched/hmbird/hmbird.c b/kernel/sched/hmbird/hmbird.c
+index b54c94c8b..3b12eedb6 100644
+--- a/kernel/sched/hmbird/hmbird.c
++++ b/kernel/sched/hmbird/hmbird.c
+@@ -78,6 +78,7 @@ static void hmbird_build_clusters(void)
+ 		if (cpumask_empty(&hmbird_cluster[id].cpus))
+ 			break;
+ 		hmbird_cluster[id].id = id;
++		hmbird_cluster[id].uclamp_min = 0;
+ 		spin_lock_init(&hmbird_cluster[id].lock);
+ 		hmbird_nr_clusters++;
+ 	}

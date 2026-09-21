@@ -1,0 +1,59 @@
+From 52739f65b8b3e877b9fa286e5c3d552d6a3f9b63 Mon Sep 17 00:00:00 2001
+From: shandongtlb <40312509+shandongtlb@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 02:19:43 +0000
+Subject: [PATCH 13/22] sched/hmbird: restore stock uclamp address evaluation
+ order
+
+Form the per-CPU validity address before the control gate and the cluster address before trace emission. This reproduces the stock bounds diagnostic order without adding explicit guards or changing valid CPU state transitions.
+---
+ kernel/sched/hmbird/hmbird.c | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/kernel/sched/hmbird/hmbird.c b/kernel/sched/hmbird/hmbird.c
+index be806ce1d..fe4a5df3f 100644
+--- a/kernel/sched/hmbird/hmbird.c
++++ b/kernel/sched/hmbird/hmbird.c
+@@ -87,6 +87,7 @@ static void hmbird_build_clusters(void)
+ static void hmbird_uclamp_inc(struct rq *rq, struct task_struct *p)
+ {
+ 	int cpu = cpu_of(rq);
++	bool *valid = &per_cpu(hmbird_cpu_uclamp_min_valid, cpu);
+ 	unsigned int id, value;
+ 	struct hmbird_sched_cluster *cluster;
+ 
+@@ -98,10 +99,10 @@ static void hmbird_uclamp_inc(struct rq *rq, struct task_struct *p)
+ 	id = topology_cluster_id(cpu);
+ 	if (id >= hmbird_nr_clusters)
+ 		return;
+-	per_cpu(hmbird_cpu_uclamp_min_valid, cpu) = true;
++	*valid = true;
+ 	hmbird_cpu_uclamp_min[cpu] = value;
+-	hmbird_internal_systrace("C|9999|Cpu_%d_uclamp_min|%u\n", cpu, value);
+ 	cluster = &hmbird_cluster[id];
++	hmbird_internal_systrace("C|9999|Cpu_%d_uclamp_min|%u\n", cpu, value);
+ 	spin_lock(&cluster->lock);
+ 	if (cluster->uclamp_min < value) {
+ 		cluster->uclamp_min = value;
+@@ -116,18 +117,19 @@ static void hmbird_uclamp_inc(struct rq *rq, struct task_struct *p)
+ static void hmbird_uclamp_dec(struct rq *rq, struct task_struct *p)
+ {
+ 	int cpu = cpu_of(rq);
++	bool *valid = &per_cpu(hmbird_cpu_uclamp_min_valid, cpu);
+ 	unsigned int id, i, value = 0;
+ 	struct hmbird_sched_cluster *cluster;
+ 
+ 	if (!uclamp_ctrl)
+ 		return;
+ 	id = topology_cluster_id(cpu);
+-	if (id >= hmbird_nr_clusters || !per_cpu(hmbird_cpu_uclamp_min_valid, cpu))
++	if (id >= hmbird_nr_clusters || !*valid)
+ 		return;
+-	per_cpu(hmbird_cpu_uclamp_min_valid, cpu) = false;
++	*valid = false;
+ 	hmbird_cpu_uclamp_min[cpu] = 0;
+-	hmbird_internal_systrace("C|9999|Cpu_%d_uclamp_min|%u\n", cpu, 0);
+ 	cluster = &hmbird_cluster[id];
++	hmbird_internal_systrace("C|9999|Cpu_%d_uclamp_min|%u\n", cpu, 0);
+ 	spin_lock(&cluster->lock);
+ 	for_each_cpu(i, &cluster->cpus)
+ 		value = max(value, hmbird_cpu_uclamp_min[i]);

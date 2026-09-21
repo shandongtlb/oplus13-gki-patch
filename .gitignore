@@ -1,0 +1,14 @@
+# Only publish documentation and the complete common patch series.
+/*
+!/.gitignore
+!/.gitattributes
+!/*.md
+!/docs/
+/docs/*
+!/docs/*.md
+!/source/
+/source/*
+!/source/patches/
+/source/patches/*
+!/source/patches/*.patch
+!/source/patches/series

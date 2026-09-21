@@ -1,0 +1,100 @@
+From d3a268331a7a8238d1a95873eae13ae202b37918 Mon Sep 17 00:00:00 2001
+From: shandongtlb <40312509+shandongtlb@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 15:09:35 +0000
+Subject: [PATCH 03/22] sched/hmbird: recover stock shadow-tick affinity state
+
+Match the supplied Image and BTF: reuse the former kf_mask slot for signed swap_cpu, initialize -2, save the old affinity for tick-hit isolation, and restore on strict window expiry without clearing the saved byte. Preserve raw BIT(30) notification and current stock window reset behavior. Extracted-helper boundary checks passed; runtime equivalence remains unverified.
+---
+ include/linux/sched/hmbird.h             |  3 +-
+ kernel/sched/hmbird/hmbird.c             |  2 +-
+ kernel/sched/hmbird/hmbird_shadow_tick.c | 43 ++++++++++++++----------
+ 3 files changed, 29 insertions(+), 19 deletions(-)
+
+diff --git a/include/linux/sched/hmbird.h b/include/linux/sched/hmbird.h
+index a298ee6f6..da427a12c 100755
+--- a/include/linux/sched/hmbird.h
++++ b/include/linux/sched/hmbird.h
+@@ -175,7 +175,8 @@ struct hmbird_entity {
+ 	u32			weight;
+ 	s32			sticky_cpu;
+ 	s32			holding_cpu;
+-	u32			kf_mask;	/* see hmbird_kf_mask above */
++	s8			swap_cpu;
++	u8			reserve[3];
+ 	struct task_struct	*kf_tasks[2];	/* see HMBIRD_CALL_OP_TASK() */
+ 	atomic64_t		ops_state;
+ 	unsigned long		runnable_at;
+diff --git a/kernel/sched/hmbird/hmbird.c b/kernel/sched/hmbird/hmbird.c
+index 86f9fd092..3b6d5d299 100644
+--- a/kernel/sched/hmbird/hmbird.c
++++ b/kernel/sched/hmbird/hmbird.c
+@@ -3203,7 +3203,7 @@ int hmbird_pre_fork(struct task_struct *p)
+ 	get_hmbird_ts(p)->weight           = 0;
+ 	get_hmbird_ts(p)->sticky_cpu       = -1;
+ 	get_hmbird_ts(p)->holding_cpu      = -1;
+-	get_hmbird_ts(p)->kf_mask          = 0;
++	get_hmbird_ts(p)->swap_cpu         = -2;
+ 	atomic64_set(&get_hmbird_ts(p)->ops_state, 0);
+ 	get_hmbird_ts(p)->runnable_at      = INITIAL_JIFFIES;
+ 	get_hmbird_ts(p)->slice            = HMBIRD_SLICE_DFL;
+diff --git a/kernel/sched/hmbird/hmbird_shadow_tick.c b/kernel/sched/hmbird/hmbird_shadow_tick.c
+index 2744cd42b..94342e56e 100644
+--- a/kernel/sched/hmbird/hmbird_shadow_tick.c
++++ b/kernel/sched/hmbird/hmbird_shadow_tick.c
+@@ -95,30 +95,39 @@ struct tick_hit_params tick_hit_params = {
+ static void tick_hit_critical_task(struct task_struct *curr, struct rq *rq)
+ {
+ 	struct hmbird_entity *see = get_hmbird_ts(curr);
++	bool top_main;
++	int target_cpu;
++
+ 	if (!tick_hit_params.enable || !see)
+ 		return;
+ 
+-	if ((!task_is_top_task(curr) || curr->pid != curr->tgid) && (curr->pid != scx_systemui_pid))
++	top_main = task_is_top_task(curr) && curr->pid == curr->tgid;
++	if (!top_main && curr->pid != scx_systemui_pid)
+ 		return;
+ 
+-	if (see->tick_hit_count == 0) {
+-		if (see->start_jiffies == 0) {
+-			see->start_jiffies = jiffies;
+-			see->tick_hit_count = 1;
+-		} else {
+-			see->start_jiffies = 0;       /* status reset */
+-			see->tick_hit_count = 0;
+-		}
+-	} else {
+-		if (time_before_eq(jiffies, see->start_jiffies + tick_hit_params.jiffies_num)) {
+-			see->tick_hit_count++;
+-			if (see->tick_hit_count >= tick_hit_params.hit_count_thres) {
+-				cpufreq_update_util(rq, HMBIRD_TICK_HIT_BOOST);
++	if (time_before_eq(jiffies, see->start_jiffies + tick_hit_params.jiffies_num)) {
++		see->tick_hit_count++;
++		if (see->tick_hit_count >= tick_hit_params.hit_count_thres) {
++			cpufreq_update_util(rq, HMBIRD_TICK_HIT_BOOST);
++			if (top_main && isolate_ctrl) {
++				target_cpu = nr_cpu_ids - 1;
++				if (see->critical_affinity_cpu != target_cpu) {
++					see->swap_cpu = (s8)see->critical_affinity_cpu;
++					see->critical_affinity_cpu = target_cpu;
++				}
++				/* Stock flag value; original BIT(30) name is unknown. */
++				cpufreq_update_util(cpu_rq(target_cpu),
++						HMBIRD_TICK_HIT_BOOST | BIT(30));
+ 			}
+-		} else {
+-			see->tick_hit_count = 1;
+-			see->start_jiffies = jiffies;
+ 		}
++	} else {
++		if (top_main && time_after(jiffies,
++				see->start_jiffies + 2 * tick_hit_params.jiffies_num) &&
++				see->swap_cpu != -2 &&
++				see->critical_affinity_cpu != see->swap_cpu)
++			see->critical_affinity_cpu = see->swap_cpu;
++		see->tick_hit_count = 1;
++		see->start_jiffies = jiffies;
+ 	}
+ }
+ 

@@ -1,0 +1,24 @@
+From f34864787733a55f7fba20ca65eda7c674e1d43e Mon Sep 17 00:00:00 2001
+From: shandongtlb <40312509+shandongtlb@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 18:55:49 +0000
+Subject: [PATCH 22/22] sched/hmbird: restore default deadline for out-of-range
+ cgroup IDs
+
+---
+ kernel/sched/core.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 019795996..72f622512 100755
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -11103,7 +11103,8 @@ static u64 cgroup_read_hmbird_deadline(struct cgroup_subsys_state *css,
+ {
+ 	u8 i;
+ 
+-	if (!css || !css->cgroup || !css->cgroup->kn)
++	if (!css || !css->cgroup || !css->cgroup->kn ||
++	    css->cgroup->kn->id >= NUMS_CGROUP_KINDS)
+ 		return (u64) HMBIRD_BPF_DSQS_DEADLINE[DEFAULT_CGROUP_DL_IDX];
+ 	i = min_t(u8, cgroup_ids_table[css->cgroup->kn->id], MAX_GLOBAL_DSQS-1);
+ 	if (i < 0) {

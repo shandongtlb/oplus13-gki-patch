@@ -1,0 +1,1589 @@
+From dcc7dda40d702dbd6f68430d9a66b6f6c7a40612 Mon Sep 17 00:00:00 2001
+From: shandongtlb <40312509+shandongtlb@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 15:09:35 +0000
+Subject: [PATCH 02/22] sched: restore built-in HMBIRD integration on current
+ common
+
+Invert the scheduler replacement hunks from c7bef25 while preserving current dmabuf, rseq, dtask and upstream fixes. Retain inactive ext source/tools. Targeted ARM64 object compilation passed with the supplied stock config; this restores the older official baseline, not complete current stock semantics.
+---
+ arch/arm64/configs/defconfig      |   3 +-
+ arch/arm64/configs/gki_defconfig  |   3 +-
+ include/asm-generic/vmlinux.lds.h |   2 +-
+ include/linux/sched.h             | 100 ++++++-
+ include/linux/sched/task.h        |   6 +-
+ include/uapi/linux/sched.h        |   2 +-
+ init/Kconfig                      |   4 -
+ init/init_task.c                  |   4 -
+ kernel/Kconfig.preempt            |   8 +-
+ kernel/bpf/bpf_struct_ops_types.h |   4 -
+ kernel/fork.c                     |  31 +-
+ kernel/sched/build_policy.c       |  10 +-
+ kernel/sched/core.c               | 473 ++++++++++++++++++++++--------
+ kernel/sched/debug.c              |  14 +-
+ kernel/sched/idle.c               |   8 +-
+ kernel/sched/sched.h              | 119 +-------
+ kernel/time/tick-sched.c          |   7 +
+ 17 files changed, 497 insertions(+), 301 deletions(-)
+
+diff --git a/arch/arm64/configs/defconfig b/arch/arm64/configs/defconfig
+index b65b815db..f52fb7f5f 100644
+--- a/arch/arm64/configs/defconfig
++++ b/arch/arm64/configs/defconfig
+@@ -6,8 +6,6 @@ CONFIG_HIGH_RES_TIMERS=y
+ CONFIG_BPF_SYSCALL=y
+ CONFIG_BPF_JIT=y
+ CONFIG_PREEMPT=y
+-CONFIG_SLIM_SCHED=y
+-CONFIG_SCHED_CLASS_EXT=y
+ CONFIG_IRQ_TIME_ACCOUNTING=y
+ CONFIG_BSD_PROCESS_ACCT=y
+ CONFIG_BSD_PROCESS_ACCT_V3=y
+@@ -1590,3 +1588,4 @@ CONFIG_CORESIGHT_STM=m
+ CONFIG_CORESIGHT_CPU_DEBUG=m
+ CONFIG_CORESIGHT_CTI=m
+ CONFIG_MEMTEST=y
++CONFIG_HMBIRD_SCHED=y
+diff --git a/arch/arm64/configs/gki_defconfig b/arch/arm64/configs/gki_defconfig
+index 9d7fc2a75..411e197db 100644
+--- a/arch/arm64/configs/gki_defconfig
++++ b/arch/arm64/configs/gki_defconfig
+@@ -10,8 +10,7 @@ CONFIG_BPF_JIT_ALWAYS_ON=y
+ # CONFIG_BPF_UNPRIV_DEFAULT_OFF is not set
+ CONFIG_BPF_LSM=y
+ CONFIG_PREEMPT=y
+-CONFIG_SLIM_SCHED=y
+-CONFIG_SCHED_CLASS_EXT=y
++CONFIG_HMBIRD_SCHED=y
+ CONFIG_IRQ_TIME_ACCOUNTING=y
+ CONFIG_TASKSTATS=y
+ CONFIG_TASK_DELAY_ACCT=y
+diff --git a/include/asm-generic/vmlinux.lds.h b/include/asm-generic/vmlinux.lds.h
+index 7ddf330f1..d2574342c 100755
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -131,7 +131,7 @@
+ 	*(__dl_sched_class)			\
+ 	*(__rt_sched_class)			\
+ 	*(__fair_sched_class)			\
+-	*(__ext_sched_class)			\
++	*(__hmbird_sched_class)			\
+ 	*(__idle_sched_class)			\
+ 	__sched_class_lowest = .;
+ 
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index a6181beb7..8c7cfec56 100755
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -74,7 +74,9 @@ struct task_dma_buf_info;
+ struct task_group;
+ struct user_event_mm;
+ 
+-#include <linux/sched/ext.h>
++#ifdef CONFIG_HMBIRD_SCHED
++#include <linux/sched/hmbird.h>
++#endif
+ 
+ /*
+  * Task state bitmask. NOTE! These bits are also
+@@ -299,11 +301,6 @@ enum {
+ 
+ extern void scheduler_tick(void);
+ 
+-#ifdef CONFIG_SLIM_SCHED
+-extern enum hrtimer_restart scheduler_tick_no_balance(struct hrtimer *timer);
+-extern void stop_shadow_tick_timer(void);
+-#endif
+-
+ #define	MAX_SCHEDULE_TIMEOUT		LONG_MAX
+ 
+ extern long schedule_timeout(long timeout);
+@@ -1524,15 +1521,9 @@ struct task_struct {
+ 	 */
+ 	struct callback_head		l1d_flush_kill;
+ #endif
+-#ifdef CONFIG_SLIM_SCHED
+-	ANDROID_KABI_USE(1, unsigned long sched_prop);
+-	ANDROID_KABI_USE(2, struct sched_ext_entity *scx);
+-	ANDROID_KABI_USE(3, struct task_dma_buf_info *dmabuf_info);
+-#else
+ 	ANDROID_KABI_USE(1, struct task_dma_buf_info *dmabuf_info);
+ 	ANDROID_KABI_RESERVE(2);
+ 	ANDROID_KABI_RESERVE(3);
+-#endif
+ 	ANDROID_KABI_RESERVE(4);
+ 	ANDROID_KABI_RESERVE(5);
+ 	ANDROID_KABI_RESERVE(6);
+@@ -1935,6 +1926,91 @@ static inline int task_nice(const struct task_struct *p)
+ 	return PRIO_TO_NICE((p)->static_prio);
+ }
+ 
++#ifdef CONFIG_HMBIRD_SCHED
++static inline bool task_is_top_task(struct task_struct *p)
++{
++	return (((struct hmbird_entity *)(p->android_oem_data1[HMBIRD_TS_IDX]))
++		->top_task_prop & TOP_TASK_BITS_MASK);
++}
++
++static inline int get_top_task_prop(struct task_struct *p)
++{
++	return get_hmbird_ts(p)->top_task_prop;
++}
++
++static inline int set_top_task_prop(struct task_struct *p, u64 set, u64 clear)
++{
++	if (set)
++		get_hmbird_ts(p)->top_task_prop |= set;
++	if (clear)
++		get_hmbird_ts(p)->top_task_prop &= ~clear;
++	return 0;
++}
++
++static inline void reset_top_task_prop(struct task_struct *p)
++{
++	get_hmbird_ts(p)->top_task_prop = 0;
++}
++
++static inline int hmbird_set_sched_prop(struct task_struct *p, unsigned long sp)
++{
++	struct hmbird_entity *entity = get_hmbird_ts(p);
++
++	if (entity) {
++		entity->sched_prop = sp;
++	}
++	return 0;
++}
++
++static inline unsigned long hmbird_get_sched_prop(struct task_struct *p)
++{
++	struct hmbird_entity *entity = get_hmbird_ts(p);
++
++	if (entity)
++		return entity->sched_prop;
++	else
++		return 0;
++}
++
++static inline void hmbird_set_dsq_id(struct task_struct *p, unsigned long dsq)
++{
++	unsigned long new_dsq;
++	struct hmbird_entity *entity = get_hmbird_ts(p);
++
++	if (entity) {
++		new_dsq = (entity->sched_prop & ~SCHED_PROP_DEADLINE_MASK) | dsq;
++		entity->sched_prop = new_dsq;
++	}
++}
++
++static inline unsigned long hmbird_get_dsq_id(struct task_struct *p)
++{
++	struct hmbird_entity *entity = get_hmbird_ts(p);
++
++	if (entity)
++		return (entity->sched_prop & SCHED_PROP_DEADLINE_MASK);
++	else
++		return 0;
++}
++
++static inline void hmbird_set_dsq_sync_ux(struct task_struct *p, int val)
++{
++	struct hmbird_entity *entity = get_hmbird_ts(p);
++
++	if (entity)
++		entity->dsq_sync_ux = val;
++}
++
++static inline int hmbird_get_dsq_sync_ux(struct task_struct *p)
++{
++	struct hmbird_entity *entity = get_hmbird_ts(p);
++
++	if (entity)
++		return entity->dsq_sync_ux;
++	else
++		return 0;
++}
++#endif
+ 
+ extern int can_nice(const struct task_struct *p, const int nice);
+ extern int task_curr(const struct task_struct *p);
+diff --git a/include/linux/sched/task.h b/include/linux/sched/task.h
+index 03d35e3ed..6a5f0c0d7 100644
+--- a/include/linux/sched/task.h
++++ b/include/linux/sched/task.h
+@@ -61,8 +61,10 @@ extern asmlinkage void schedule_tail(struct task_struct *prev);
+ extern void init_idle(struct task_struct *idle, int cpu);
+ 
+ extern int sched_fork(unsigned long clone_flags, struct task_struct *p);
+-extern int sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs);
+-extern void sched_cancel_fork(struct task_struct *p);
++extern void sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs);
++#ifdef CONFIG_HMBIRD_SCHED
++extern void hmbird_cancel_fork(struct task_struct *p);
++#endif
+ extern void sched_post_fork(struct task_struct *p);
+ extern void sched_dead(struct task_struct *p);
+ 
+diff --git a/include/uapi/linux/sched.h b/include/uapi/linux/sched.h
+index 359a14cc7..969716ab4 100755
+--- a/include/uapi/linux/sched.h
++++ b/include/uapi/linux/sched.h
+@@ -118,7 +118,7 @@ struct clone_args {
+ /* SCHED_ISO: reserved but not implemented yet */
+ #define SCHED_IDLE		5
+ #define SCHED_DEADLINE		6
+-#define SCHED_EXT		7
++#define SCHED_HMBIRD		7
+ 
+ /* Can be ORed in to make sure the process is reverted back to SCHED_NORMAL on fork */
+ #define SCHED_RESET_ON_FORK     0x40000000
+diff --git a/init/Kconfig b/init/Kconfig
+index fbb3b41e6..4678d3eb3 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1030,10 +1030,6 @@ config RT_GROUP_SCHED
+ 	  realtime bandwidth for them.
+ 	  See Documentation/scheduler/sched-rt-group.rst for more information.
+ 
+-config EXT_GROUP_SCHED
+-	bool
+-	depends on SCHED_CLASS_EXT && CGROUP_SCHED
+-	default y
+ endif #CGROUP_SCHED
+ 
+ config SCHED_MM_CID
+diff --git a/init/init_task.c b/init/init_task.c
+index e01803ae4..d80c007ab 100755
+--- a/init/init_task.c
++++ b/init/init_task.c
+@@ -6,7 +6,6 @@
+ #include <linux/sched/sysctl.h>
+ #include <linux/sched/rt.h>
+ #include <linux/sched/task.h>
+-#include <linux/sched/ext.h>
+ #include <linux/init.h>
+ #include <linux/fs.h>
+ #include <linux/mm.h>
+@@ -102,9 +101,6 @@ struct task_struct init_task
+ #endif
+ #ifdef CONFIG_CGROUP_SCHED
+ 	.sched_task_group = &root_task_group,
+-#endif
+-#ifdef CONFIG_SLIM_SCHED
+-	.scx		= NULL,
+ #endif
+ 	.ptraced	= LIST_HEAD_INIT(init_task.ptraced),
+ 	.ptrace_entry	= LIST_HEAD_INIT(init_task.ptrace_entry),
+diff --git a/kernel/Kconfig.preempt b/kernel/Kconfig.preempt
+index cf22ef610..ca8de6eb1 100755
+--- a/kernel/Kconfig.preempt
++++ b/kernel/Kconfig.preempt
+@@ -133,12 +133,8 @@ config SCHED_CORE
+ 	  which is the likely usage by Linux distributions, there should
+ 	  be no measurable impact on performance.
+ 
+-config SLIM_SCHED
+-	bool "slim sched"
+-	default n
+-config SCHED_CLASS_EXT
+-	bool "Extensible Scheduling Class"
+-	depends on BPF_SYSCALL && BPF_JIT
++config HMBIRD_SCHED
++	bool "hmbird Scheduling Class(base on ext scheduler)"
+ 	help
+ 	  This option enables a new scheduler class sched_ext (SCX), which
+ 	  allows scheduling policies to be implemented as BPF programs to
+diff --git a/kernel/bpf/bpf_struct_ops_types.h b/kernel/bpf/bpf_struct_ops_types.h
+index 3618769d8..5678a9ddf 100644
+--- a/kernel/bpf/bpf_struct_ops_types.h
++++ b/kernel/bpf/bpf_struct_ops_types.h
+@@ -9,8 +9,4 @@ BPF_STRUCT_OPS_TYPE(bpf_dummy_ops)
+ #include <net/tcp.h>
+ BPF_STRUCT_OPS_TYPE(tcp_congestion_ops)
+ #endif
+-#ifdef CONFIG_SCHED_CLASS_EXT
+-#include <linux/sched/ext.h>
+-BPF_STRUCT_OPS_TYPE(sched_ext_ops)
+-#endif
+ #endif
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 28cd36bc6..a0b73f160 100755
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -23,7 +23,9 @@
+ #include <linux/sched/task.h>
+ #include <linux/sched/task_stack.h>
+ #include <linux/sched/cputime.h>
+-#include <linux/sched/ext.h>
++#ifdef CONFIG_HMBIRD_SCHED
++#include <linux/sched/hmbird.h>
++#endif
+ #include <linux/seq_file.h>
+ #include <linux/rtmutex.h>
+ #include <linux/init.h>
+@@ -1003,7 +1005,9 @@ void __put_task_struct(struct task_struct *tsk)
+ 	WARN_ON(refcount_read(&tsk->usage));
+ 	WARN_ON(tsk == current);
+ 
+-	sched_ext_free(tsk);
++#ifdef CONFIG_HMBIRD_SCHED
++	hmbird_free(tsk);
++#endif
+ 	trace_android_vh_put_task(tsk);
+ 	put_dmabuf_info(tsk->dmabuf_info);
+ 	io_uring_free(tsk);
+@@ -2526,7 +2530,11 @@ __latent_entropy struct task_struct *copy_process(
+ 
+ 	retval = perf_event_init_task(p, clone_flags);
+ 	if (retval)
+-		goto bad_fork_sched_cancel_fork;
++#ifdef CONFIG_HMBIRD_SCHED
++		goto bad_fork_hmbird_cancel_fork;
++#else
++		goto bad_fork_cleanup_policy;
++#endif
+ 	retval = audit_alloc(p);
+ 	if (retval)
+ 		goto bad_fork_cleanup_perf;
+@@ -2664,9 +2672,7 @@ __latent_entropy struct task_struct *copy_process(
+ 	 * cgroup specific, it unconditionally needs to place the task on a
+ 	 * runqueue.
+ 	 */
+-	retval = sched_cgroup_fork(p, args);
+-	if (retval)
+-		goto bad_fork_cancel_cgroup;
++	sched_cgroup_fork(p, args);
+ 
+ 	/*
+ 	 * From this point on we must avoid any synchronous user-space
+@@ -2712,13 +2718,13 @@ __latent_entropy struct task_struct *copy_process(
+ 	/* Don't start children in a dying pid namespace */
+ 	if (unlikely(!(ns_of_pid(pid)->pid_allocated & PIDNS_ADDING))) {
+ 		retval = -ENOMEM;
+-		goto bad_fork_core_free;
++		goto bad_fork_cancel_cgroup;
+ 	}
+ 
+ 	/* Let kill terminate clone/fork in the middle */
+ 	if (fatal_signal_pending(current)) {
+ 		retval = -EINTR;
+-		goto bad_fork_core_free;
++		goto bad_fork_cancel_cgroup;
+ 	}
+ 
+ 	/* No more failure paths after this point. */
+@@ -2796,11 +2802,10 @@ __latent_entropy struct task_struct *copy_process(
+ 
+ 	return p;
+ 
+-bad_fork_core_free:
++bad_fork_cancel_cgroup:
+ 	sched_core_free(p);
+ 	spin_unlock(&current->sighand->siglock);
+ 	write_unlock_irq(&tasklist_lock);
+-bad_fork_cancel_cgroup:
+ 	cgroup_cancel_fork(p, args);
+ bad_fork_cleanup_dmabuf:
+ 	put_dmabuf_info(p->dmabuf_info);
+@@ -2841,8 +2846,10 @@ __latent_entropy struct task_struct *copy_process(
+ 	audit_free(p);
+ bad_fork_cleanup_perf:
+ 	perf_event_free_task(p);
+-bad_fork_sched_cancel_fork:
+-	sched_cancel_fork(p);
++#ifdef CONFIG_HMBIRD_SCHED
++bad_fork_hmbird_cancel_fork:
++	hmbird_cancel_fork(p);
++#endif
+ bad_fork_cleanup_policy:
+ 	lockdep_free_task(p);
+ #ifdef CONFIG_NUMA
+diff --git a/kernel/sched/build_policy.c b/kernel/sched/build_policy.c
+index 005025f55..c091539a0 100755
+--- a/kernel/sched/build_policy.c
++++ b/kernel/sched/build_policy.c
+@@ -28,8 +28,10 @@
+ #include <linux/suspend.h>
+ #include <linux/tsacct_kern.h>
+ #include <linux/vtime.h>
++#ifdef CONFIG_HMBIRD_SCHED
+ #include <linux/sysrq.h>
+ #include <linux/percpu-rwsem.h>
++#endif
+ 
+ #include <uapi/linux/sched/types.h>
+ 
+@@ -54,6 +56,10 @@
+ #include "cputime.c"
+ #include "deadline.c"
+ 
+-#ifdef CONFIG_SCHED_CLASS_EXT
+-# include "ext.c"
++#ifdef CONFIG_HMBIRD_SCHED
++#include "hmbird/hmbird_util_track.c"
++#include "hmbird/hmbird_sched_proc.c"
++#include "hmbird/hmbird_shadow_tick.c"
++#include "hmbird/hmbird.c"
++#include "hmbird/hmbird_misc.c"
+ #endif
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index b49273faf..019795996 100755
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -96,6 +96,12 @@
+ #include "../../io_uring/io-wq.h"
+ #include "../smpboot.h"
+ 
++#ifdef CONFIG_HMBIRD_SCHED
++#include "hmbird/slim.h"
++#include "hmbird/hmbird_shadow_tick.h"
++#include "hmbird.h"
++#endif
++
+ #include <trace/hooks/sched.h>
+ #include <trace/hooks/cgroup.h>
+ #include <trace/hooks/dtask.h>
+@@ -170,7 +176,6 @@ __read_mostly int scheduler_running;
+ 
+ DEFINE_STATIC_KEY_FALSE(__sched_core_enabled);
+ 
+-
+ /* kernel prio, less is more */
+ static inline int __task_prio(const struct task_struct *p)
+ {
+@@ -183,11 +188,10 @@ static inline int __task_prio(const struct task_struct *p)
+ 	if (p->sched_class == &idle_sched_class)
+ 		return MAX_RT_PRIO + NICE_WIDTH; /* 140 */
+ 
+-#ifdef CONFIG_SCHED_CLASS_EXT
+-	if (p->sched_class == &ext_sched_class)
++#ifdef CONFIG_HMBIRD_SCHED
++	if (p->sched_class == &hmbird_sched_class)
+ 		return MAX_RT_PRIO + MAX_NICE + 1; /* 120, squash ext */
+ #endif
+-
+ 	return MAX_RT_PRIO + MAX_NICE; /* 119, squash fair */
+ }
+ 
+@@ -217,9 +221,9 @@ static inline bool prio_less(const struct task_struct *a,
+ 	if (pa == MAX_RT_PRIO + MAX_NICE)	/* fair */
+ 		return cfs_prio_less(a, b, in_fi);
+ 
+-#ifdef CONFIG_SCHED_CLASS_EXT
++#ifdef CONFIG_HMBIRD_SCHED
+ 	if (pa == MAX_RT_PRIO + MAX_NICE + 1)	/* ext */
+-		return scx_prio_less(a, b, in_fi);
++		return hmbird_prio_less(a, b, in_fi);
+ #endif
+ 
+ 	return false;
+@@ -1279,17 +1283,26 @@ bool sched_can_stop_tick(struct rq *rq)
+ 	if (fifo_nr_running)
+ 		return true;
+ 
++#ifdef CONFIG_HMBIRD_SCHED
+ 	/*
+-	 * If there are no DL,RR/FIFO tasks, there must only be CFS or SCX tasks
++	 * If there are no DL,RR/FIFO tasks, there must only be CFS or HMBIRD tasks
+ 	 * left. For CFS, if there's more than one we need the tick for
+-	 * involuntary preemption. For SCX, ask.
++	 * involuntary preemption. For HMBIRD, ask.
+ 	 */
+-	if (!scx_switched_all() && rq->nr_running > 1)
++	if (!hmbird_enabled() && rq->nr_running > 1)
+ 		return false;
+ 
+-	if (scx_enabled() && !scx_can_stop_tick(rq))
++	if (hmbird_enabled() && !hmbird_can_stop_tick(rq))
+ 		return false;
+-
++#else
++	/*
++	 * If there are no DL,RR/FIFO tasks, there must only be CFS tasks left;
++	 * if there's more than one we need the tick for involuntary
++	 * preemption.
++	 */
++	if (rq->nr_running > 1)
++		return false;
++#endif
+ 	/*
+ 	 * If there is one task and it has CFS runtime bandwidth constraints
+ 	 * and it's on the cpu now we don't want to stop the tick.
+@@ -2222,10 +2235,11 @@ void deactivate_task(struct rq *rq, struct task_struct *p, int flags)
+ }
+ EXPORT_SYMBOL_GPL(deactivate_task);
+ 
+-struct sched_change_guard
+-sched_change_guard_init(struct rq *rq, struct task_struct *p, int flags)
++#ifdef CONFIG_HMBIRD_SCHED
++struct hmbird_sched_change_guard
++hmbird_sched_change_guard_init(struct rq *rq, struct task_struct *p, int flags)
+ {
+-	struct sched_change_guard cg = {
++	struct hmbird_sched_change_guard cg = {
+ 		.rq = rq,
+ 		.p = p,
+ 		.queued = task_on_rq_queued(p),
+@@ -2247,7 +2261,7 @@ sched_change_guard_init(struct rq *rq, struct task_struct *p, int flags)
+ 	return cg;
+ }
+ 
+-void sched_change_guard_fini(struct sched_change_guard *cg, int flags)
++void hmbird_sched_change_guard_fini(struct hmbird_sched_change_guard *cg, int flags)
+ {
+ 	if (cg->queued)
+ 		enqueue_task(cg->rq, cg->p, flags | ENQUEUE_NOCLOCK);
+@@ -2255,6 +2269,7 @@ void sched_change_guard_fini(struct sched_change_guard *cg, int flags)
+ 		set_next_task(cg->rq, cg->p);
+ 	cg->done = true;
+ }
++#endif
+ 
+ static inline int __normal_prio(int policy, int rt_prio, int nice)
+ {
+@@ -2320,9 +2335,9 @@ inline int task_curr(const struct task_struct *p)
+  * this means any call to check_class_changed() must be followed by a call to
+  * balance_callback().
+  */
+-void check_class_changed(struct rq *rq, struct task_struct *p,
+-			 const struct sched_class *prev_class,
+-			 int oldprio)
++static inline void check_class_changed(struct rq *rq, struct task_struct *p,
++				       const struct sched_class *prev_class,
++				       int oldprio)
+ {
+ 	if (prev_class != p->sched_class) {
+ 		if (prev_class->switched_from)
+@@ -2885,6 +2900,7 @@ static void
+ __do_set_cpus_allowed(struct task_struct *p, struct affinity_context *ctx)
+ {
+ 	struct rq *rq = task_rq(p);
++	bool queued, running;
+ 
+ 	/*
+ 	 * This here violates the locking rules for affinity, since we're only
+@@ -2903,9 +2919,26 @@ __do_set_cpus_allowed(struct task_struct *p, struct affinity_context *ctx)
+ 	else
+ 		lockdep_assert_held(&p->pi_lock);
+ 
+-	SCHED_CHANGE_BLOCK(rq, p, DEQUEUE_SAVE | DEQUEUE_NOCLOCK) {
+-		p->sched_class->set_cpus_allowed(p, ctx);
++	queued = task_on_rq_queued(p);
++	running = task_current(rq, p);
++
++	if (queued) {
++		/*
++		 * Because __kthread_bind() calls this on blocked tasks without
++		 * holding rq->lock.
++		 */
++		lockdep_assert_rq_held(rq);
++		dequeue_task(rq, p, DEQUEUE_SAVE | DEQUEUE_NOCLOCK);
+ 	}
++	if (running)
++		put_prev_task(rq, p);
++
++	p->sched_class->set_cpus_allowed(p, ctx);
++
++	if (queued)
++		enqueue_task(rq, p, ENQUEUE_RESTORE | ENQUEUE_NOCLOCK);
++	if (running)
++		set_next_task(rq, p);
+ }
+ 
+ /*
+@@ -3772,7 +3805,11 @@ int select_task_rq(struct task_struct *p, int cpu, int wake_flags)
+ 	 * [ this allows ->select_task() to simply return task_cpu(p) and
+ 	 *   not worry about this generic constraint ]
+ 	 */
++#ifdef CONFIG_HMBIRD_SCHED
++	if (unlikely(!is_cpu_allowed(p, cpu)) && (p->sched_class != &hmbird_sched_class))
++#else
+ 	if (unlikely(!is_cpu_allowed(p, cpu)))
++#endif
+ 		cpu = select_fallback_rq(task_cpu(p), p);
+ 
+ 	return cpu;
+@@ -4896,8 +4933,9 @@ late_initcall(sched_core_sysctl_init);
+  */
+ int sched_fork(unsigned long clone_flags, struct task_struct *p)
+ {
+-
++#ifdef CONFIG_HMBIRD_SCHED
+ 	int ret;
++#endif
+ 
+ 	trace_android_rvh_sched_fork(p);
+ 
+@@ -4938,21 +4976,29 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
+ 		p->sched_reset_on_fork = 0;
+ 	}
+ 
+-	scx_pre_fork(p);
++#ifdef CONFIG_HMBIRD_SCHED
++	ret = hmbird_pre_fork(p);
++	if (ret)
++		goto out_cancel;
+ 
+ 	if (dl_prio(p->prio)) {
+ 		ret = -EAGAIN;
+ 		goto out_cancel;
+-#ifdef CONFIG_SCHED_CLASS_EXT
+-	} else if (task_on_scx(p)) {
+-		p->sched_class = &ext_sched_class;
+-#endif
++	} else if (task_on_hmbird(p)) {
++		p->sched_class = &hmbird_sched_class;
+ 	} else if (rt_prio(p->prio)) {
+ 		p->sched_class = &rt_sched_class;
+ 	} else {
+ 		p->sched_class = &fair_sched_class;
+ 	}
+-
++#else
++	if (dl_prio(p->prio))
++		return -EAGAIN;
++	else if (rt_prio(p->prio))
++		p->sched_class = &rt_sched_class;
++	else
++		p->sched_class = &fair_sched_class;
++#endif
+ 	init_entity_runnable_average(&p->se);
+ 	trace_android_rvh_finish_prio_fork(p);
+ 
+@@ -4971,12 +5017,14 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
+ #endif
+ 	return 0;
+ 
++#ifdef CONFIG_HMBIRD_SCHED
+ out_cancel:
+-	scx_cancel_fork(p);
++	hmbird_cancel_fork(p);
+ 	return ret;
++#endif
+ }
+ 
+-int sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs)
++void sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs)
+ {
+ 	unsigned long flags;
+ 
+@@ -5003,20 +5051,14 @@ int sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs)
+ 	if (p->sched_class->task_fork)
+ 		p->sched_class->task_fork(p);
+ 	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
+-
+-	return scx_fork(p);
+-}
+-
+-void sched_cancel_fork(struct task_struct *p)
+-{
+-	scx_cancel_fork(p);
+ }
+ 
+ void sched_post_fork(struct task_struct *p)
+ {
+ 	uclamp_post_fork(p);
+-
+-	scx_post_fork(p);
++#ifdef CONFIG_HMBIRD_SCHED
++	hmbird_post_fork(p);
++#endif
+ }
+ 
+ unsigned long to_ratio(u64 period, u64 runtime)
+@@ -5880,21 +5922,28 @@ void scheduler_tick(void)
+ 
+ 	if (sched_feat(LATENCY_WARN) && resched_latency)
+ 		resched_latency_warn(cpu, resched_latency);
+-
+-	scx_notify_sched_tick();
++#ifdef CONFIG_HMBIRD_SCHED
++	hmbird_notify_sched_tick();
++#endif
+ 	perf_event_task_tick();
+ 
+ 	if (curr->flags & PF_WQ_WORKER)
+ 		wq_worker_tick(curr);
+ 
+ #ifdef CONFIG_SMP
+-	if (!scx_switched_all()) {
++#ifdef CONFIG_HMBIRD_SCHED
++	if (!hmbird_enabled()) {
++#endif
+ 		rq->idle_balance = idle_cpu(cpu);
+ 		trigger_load_balance(rq);
++#ifdef CONFIG_HMBIRD_SCHED
+ 	}
++#endif
+ #endif
+ 	trace_android_vh_scheduler_tick(rq);
+-
++#ifdef CONFIG_HMBIRD_SCHED
++	scheduler_tick_handler(NULL, NULL);
++#endif
+ }
+ 
+ #ifdef CONFIG_NO_HZ_FULL
+@@ -6196,7 +6245,11 @@ static void put_prev_task_balance(struct rq *rq, struct task_struct *prev,
+ 	 * We can terminate the balance pass as soon as we know there is
+ 	 * a runnable task of @class priority or higher.
+ 	 */
++#ifdef CONFIG_HMBIRD_SCHED
+ 	for_balance_class_range(class, prev->sched_class, &idle_sched_class) {
++#else
++	for_class_range(class, prev->sched_class, &idle_sched_class) {
++#endif
+ 		if (class->balance(rq, prev, rf))
+ 			break;
+ 	}
+@@ -6214,9 +6267,10 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+ 	const struct sched_class *class;
+ 	struct task_struct *p;
+ 
+-	if (scx_enabled())
++#ifdef CONFIG_HMBIRD_SCHED
++	if (hmbird_enabled())
+ 		goto restart;
+-
++#endif
+ 	/*
+ 	 * Optimization: we know that if all tasks are in the fair class we can
+ 	 * call that function directly, but only if the @prev task wasn't of a
+@@ -6244,13 +6298,21 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+ restart:
+ 	put_prev_task_balance(rq, prev, rf);
+ 
++#ifdef CONFIG_HMBIRD_SCHED
+ 	for_each_active_class(class) {
+ 		p = class->pick_next_task(rq);
+ 		if (p) {
+-			scx_notify_pick_next_task(rq, p, class);
++			hmbird_notify_pick_next_task(rq, p, class);
+ 			return p;
+ 		}
+ 	}
++#else
++	for_each_class(class) {
++		p = class->pick_next_task(rq);
++		if (p)
++			return p;
++	}
++#endif
+ 
+ 	BUG(); /* The idle class should always have a runnable task. */
+ }
+@@ -6279,7 +6341,11 @@ static inline struct task_struct *pick_task(struct rq *rq)
+ 	const struct sched_class *class;
+ 	struct task_struct *p;
+ 
++#ifdef CONFIG_HMBIRD_SCHED
+ 	for_each_active_class(class) {
++#else
++	for_each_class(class) {
++#endif
+ 		p = class->pick_task(rq);
+ 		if (p)
+ 			return p;
+@@ -6930,7 +6996,9 @@ static void __sched notrace __schedule(unsigned int sched_mode)
+ 		psi_sched_switch(prev, next, !task_on_rq_queued(prev));
+ 
+ 		trace_sched_switch(sched_mode & SM_MASK_PREEMPT, prev, next, prev_state);
+-
++#ifdef CONFIG_HMBIRD_SCHED
++		sched_switch_handler(NULL, sched_mode & SM_MASK_PREEMPT, prev, next, prev_state);
++#endif
+ 		/* Also unlocks the rq: */
+ 		rq = context_switch(rq, prev, next, &rf);
+ 	} else {
+@@ -7258,24 +7326,31 @@ int default_wake_function(wait_queue_entry_t *curr, unsigned mode, int wake_flag
+ }
+ EXPORT_SYMBOL(default_wake_function);
+ 
+-void __setscheduler_prio(struct task_struct *p, int prio)
++static void __setscheduler_prio(struct task_struct *p, int prio)
+ {
+-	/*
+-	 * After switching all rt and fair class to ext,
+-	 * stop class is switched to ext class too. Just
+-	 * skip it. */
++#ifdef CONFIG_HMBIRD_SCHED
++	bool on_hmbird = task_on_hmbird(p);
++
+ 	if (p->sched_class == &stop_sched_class)
+-		;/* do nothing */
++		;
+ 	else if (dl_prio(prio))
+ 		p->sched_class = &dl_sched_class;
+-#ifdef CONFIG_SCHED_CLASS_EXT
+-	else if (task_on_scx(p))
+-		p->sched_class = &ext_sched_class;
+-#endif
++	else if (rt_prio(prio) && on_hmbird)
++		p->sched_class = &hmbird_sched_class;
+ 	else if (rt_prio(prio))
+ 		p->sched_class = &rt_sched_class;
++	else if (on_hmbird)
++		p->sched_class = &hmbird_sched_class;
+ 	else
+ 		p->sched_class = &fair_sched_class;
++#else
++	if (dl_prio(prio))
++		p->sched_class = &dl_sched_class;
++	else if (rt_prio(prio))
++		p->sched_class = &rt_sched_class;
++	else
++		p->sched_class = &fair_sched_class;
++#endif
+ 
+ 	p->prio = prio;
+ 	trace_android_rvh_setscheduler_prio(p);
+@@ -7311,7 +7386,7 @@ static inline int rt_effective_prio(struct task_struct *p, int prio)
+  */
+ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
+ {
+-	int prio, oldprio, queue_flag =
++	int prio, oldprio, queued, running, queue_flag =
+ 		DEQUEUE_SAVE | DEQUEUE_MOVE | DEQUEUE_NOCLOCK;
+ 	const struct sched_class *prev_class;
+ 	struct rq_flags rf;
+@@ -7374,42 +7449,52 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
+ 		queue_flag &= ~DEQUEUE_MOVE;
+ 
+ 	prev_class = p->sched_class;
+-	SCHED_CHANGE_BLOCK(rq, p, queue_flag) {
+-		/*
+-		 * Boosting condition are:
+-		 * 1. -rt task is running and holds mutex A
+-		 *      --> -dl task blocks on mutex A
+-		 *
+-		 * 2. -dl task is running and holds mutex A
+-		 *      --> -dl task blocks on mutex A and could preempt the
+-		 *          running task
+-		 */
+-		if (dl_prio(prio)) {
+-			if (!dl_prio(p->normal_prio) ||
+-			    (pi_task && dl_prio(pi_task->prio) &&
+-			     dl_entity_preempt(&pi_task->dl, &p->dl))) {
+-				p->dl.pi_se = pi_task->dl.pi_se;
+-				queue_flag |= ENQUEUE_REPLENISH;
+-			} else {
+-				p->dl.pi_se = &p->dl;
+-			}
+-		} else if (rt_prio(prio)) {
+-			if (dl_prio(oldprio))
+-				p->dl.pi_se = &p->dl;
+-			if (oldprio < prio)
+-				queue_flag |= ENQUEUE_HEAD;
++	queued = task_on_rq_queued(p);
++	running = task_current(rq, p);
++	if (queued)
++		dequeue_task(rq, p, queue_flag);
++	if (running)
++		put_prev_task(rq, p);
++
++	/*
++	 * Boosting condition are:
++	 * 1. -rt task is running and holds mutex A
++	 *      --> -dl task blocks on mutex A
++	 *
++	 * 2. -dl task is running and holds mutex A
++	 *      --> -dl task blocks on mutex A and could preempt the
++	 *          running task
++	 */
++	if (dl_prio(prio)) {
++		if (!dl_prio(p->normal_prio) ||
++		    (pi_task && dl_prio(pi_task->prio) &&
++		     dl_entity_preempt(&pi_task->dl, &p->dl))) {
++			p->dl.pi_se = pi_task->dl.pi_se;
++			queue_flag |= ENQUEUE_REPLENISH;
+ 		} else {
+-			if (dl_prio(oldprio))
+-				p->dl.pi_se = &p->dl;
+-			else if (rt_prio(oldprio))
+-				p->rt.timeout = 0;
+-			else if (!task_has_idle_policy(p))
+-				reweight_task(p, prio - MAX_RT_PRIO);
++			p->dl.pi_se = &p->dl;
+ 		}
+-
+-		__setscheduler_prio(p, prio);
++	} else if (rt_prio(prio)) {
++		if (dl_prio(oldprio))
++			p->dl.pi_se = &p->dl;
++		if (oldprio < prio)
++			queue_flag |= ENQUEUE_HEAD;
++	} else {
++		if (dl_prio(oldprio))
++			p->dl.pi_se = &p->dl;
++		else if (rt_prio(oldprio))
++			p->rt.timeout = 0;
++		else if (!task_has_idle_policy(p))
++			reweight_task(p, prio - MAX_RT_PRIO);
+ 	}
+ 
++	__setscheduler_prio(p, prio);
++
++	if (queued)
++		enqueue_task(rq, p, queue_flag);
++	if (running)
++		set_next_task(rq, p);
++
+ 	check_class_changed(rq, p, prev_class, oldprio);
+ out_unlock:
+ 	/* Avoid rq from going away on us: */
+@@ -7430,7 +7515,7 @@ static inline int rt_effective_prio(struct task_struct *p, int prio)
+ 
+ void set_user_nice(struct task_struct *p, long nice)
+ {
+-	bool allowed = false;
++	bool queued, running, allowed = false;
+ 	int old_prio;
+ 	struct rq_flags rf;
+ 	struct rq *rq;
+@@ -7459,13 +7544,22 @@ void set_user_nice(struct task_struct *p, long nice)
+ 		p->static_prio = NICE_TO_PRIO(nice);
+ 		goto out_unlock;
+ 	}
++	queued = task_on_rq_queued(p);
++	running = task_current(rq, p);
++	if (queued)
++		dequeue_task(rq, p, DEQUEUE_SAVE | DEQUEUE_NOCLOCK);
++	if (running)
++		put_prev_task(rq, p);
+ 
+-	SCHED_CHANGE_BLOCK(rq, p, DEQUEUE_SAVE | DEQUEUE_NOCLOCK) {
+-		p->static_prio = NICE_TO_PRIO(nice);
+-		set_load_weight(p, true);
+-		old_prio = p->prio;
+-		p->prio = effective_prio(p);
+-	}
++	p->static_prio = NICE_TO_PRIO(nice);
++	set_load_weight(p, true);
++	old_prio = p->prio;
++	p->prio = effective_prio(p);
++
++	if (queued)
++		enqueue_task(rq, p, ENQUEUE_RESTORE | ENQUEUE_NOCLOCK);
++	if (running)
++		set_next_task(rq, p);
+ 
+ 	/*
+ 	 * If the task increased its priority or is running and
+@@ -7882,7 +7976,7 @@ static int __sched_setscheduler(struct task_struct *p,
+ 				bool user, bool pi)
+ {
+ 	int oldpolicy = -1, policy = attr->sched_policy;
+-	int retval, oldprio, newprio;
++	int retval, oldprio, newprio, queued, running;
+ 	const struct sched_class *prev_class;
+ 	struct balance_callback *head;
+ 	struct rq_flags rf;
+@@ -7890,7 +7984,9 @@ static int __sched_setscheduler(struct task_struct *p,
+ 	int queue_flags = DEQUEUE_SAVE | DEQUEUE_MOVE | DEQUEUE_NOCLOCK;
+ 	struct rq *rq;
+ 	bool cpuset_locked = false;
+-
++#ifdef CONFIG_HMBIRD_SCHED
++	unsigned long flags;
++#endif
+ 
+ 	/* The pi code expects interrupts enabled */
+ 	BUG_ON(pi && in_interrupt());
+@@ -7956,7 +8052,9 @@ static int __sched_setscheduler(struct task_struct *p,
+ 	 * To be able to change p->policy safely, the appropriate
+ 	 * runqueue lock must be held.
+ 	 */
+-
++#ifdef CONFIG_HMBIRD_SCHED
++	spin_lock_irqsave(&hmbird_tasks_lock, flags);
++#endif
+ 	rq = task_rq_lock(p, &rf);
+ 	update_rq_clock(rq);
+ 
+@@ -7968,10 +8066,11 @@ static int __sched_setscheduler(struct task_struct *p,
+ 		goto unlock;
+ 	}
+ 
+-	retval = scx_check_setscheduler(p, policy);
++#ifdef CONFIG_HMBIRD_SCHED
++	retval = hmbird_check_setscheduler(p, policy);
+ 	if (retval)
+ 		goto unlock;
+-
++#endif
+ 	/*
+ 	 * If not changing anything there's no need to proceed further,
+ 	 * but store a possible modification of reset_on_fork.
+@@ -8028,7 +8127,9 @@ static int __sched_setscheduler(struct task_struct *p,
+ 	if (unlikely(oldpolicy != -1 && oldpolicy != p->policy)) {
+ 		policy = oldpolicy = -1;
+ 		task_rq_unlock(rq, p, &rf);
+-
++#ifdef CONFIG_HMBIRD_SCHED
++		spin_unlock_irqrestore(&hmbird_tasks_lock, flags);
++#endif
+ 		if (cpuset_locked)
+ 			cpuset_unlock();
+ 		goto recheck;
+@@ -8061,16 +8162,23 @@ static int __sched_setscheduler(struct task_struct *p,
+ 			queue_flags &= ~DEQUEUE_MOVE;
+ 	}
+ 
+-	SCHED_CHANGE_BLOCK(rq, p, queue_flags) {
+-		prev_class = p->sched_class;
++	queued = task_on_rq_queued(p);
++	running = task_current(rq, p);
++	if (queued)
++		dequeue_task(rq, p, queue_flags);
++	if (running)
++		put_prev_task(rq, p);
++
++	prev_class = p->sched_class;
+ 
+-		if (!(attr->sched_flags & SCHED_FLAG_KEEP_PARAMS)) {
+-			__setscheduler_params(p, attr);
+-			__setscheduler_prio(p, newprio);
+-			trace_android_rvh_setscheduler(p);
+-		}
+-		__setscheduler_uclamp(p, attr);
++	if (!(attr->sched_flags & SCHED_FLAG_KEEP_PARAMS)) {
++		__setscheduler_params(p, attr);
++		__setscheduler_prio(p, newprio);
++		trace_android_rvh_setscheduler(p);
++	}
++	__setscheduler_uclamp(p, attr);
+ 
++	if (queued) {
+ 		/*
+ 		 * We enqueue to tail when the priority of a task is
+ 		 * increased (user space view).
+@@ -8078,7 +8186,10 @@ static int __sched_setscheduler(struct task_struct *p,
+ 		if (oldprio < p->prio)
+ 			queue_flags |= ENQUEUE_HEAD;
+ 
++		enqueue_task(rq, p, queue_flags);
+ 	}
++	if (running)
++		set_next_task(rq, p);
+ 
+ 	check_class_changed(rq, p, prev_class, oldprio);
+ 
+@@ -8086,7 +8197,9 @@ static int __sched_setscheduler(struct task_struct *p,
+ 	preempt_disable();
+ 	head = splice_balance_callbacks(rq);
+ 	task_rq_unlock(rq, p, &rf);
+-
++#ifdef CONFIG_HMBIRD_SCHED
++	spin_unlock_irqrestore(&hmbird_tasks_lock, flags);
++#endif
+ 	if (pi) {
+ 		if (cpuset_locked)
+ 			cpuset_unlock();
+@@ -8101,7 +8214,9 @@ static int __sched_setscheduler(struct task_struct *p,
+ 
+ unlock:
+ 	task_rq_unlock(rq, p, &rf);
+-
++#ifdef CONFIG_HMBIRD_SCHED
++	spin_unlock_irqrestore(&hmbird_tasks_lock, flags);
++#endif
+ 	if (cpuset_locked)
+ 		cpuset_unlock();
+ 	return retval;
+@@ -8799,6 +8914,9 @@ static void do_sched_yield(void)
+ 	long skip = 0;
+ 
+ 	trace_android_rvh_before_do_sched_yield(&skip);
++#ifdef CONFIG_HMBIRD_SCHED
++	hmbird_skip_yield(&skip);
++#endif
+ 	if (skip)
+ 		return;
+ 
+@@ -9323,7 +9441,9 @@ SYSCALL_DEFINE1(sched_get_priority_max, int, policy)
+ 	case SCHED_NORMAL:
+ 	case SCHED_BATCH:
+ 	case SCHED_IDLE:
+-	case SCHED_EXT:
++#ifdef CONFIG_HMBIRD_SCHED
++	case SCHED_HMBIRD:
++#endif
+ 		ret = 0;
+ 		break;
+ 	}
+@@ -9351,7 +9471,9 @@ SYSCALL_DEFINE1(sched_get_priority_min, int, policy)
+ 	case SCHED_NORMAL:
+ 	case SCHED_BATCH:
+ 	case SCHED_IDLE:
+-	case SCHED_EXT:
++#ifdef CONFIG_HMBIRD_SCHED
++	case SCHED_HMBIRD:
++#endif
+ 		ret = 0;
+ 	}
+ 	return ret;
+@@ -9652,15 +9774,25 @@ int migrate_task_to(struct task_struct *p, int target_cpu)
+  */
+ void sched_setnuma(struct task_struct *p, int nid)
+ {
++	bool queued, running;
+ 	struct rq_flags rf;
+ 	struct rq *rq;
+ 
+ 	rq = task_rq_lock(p, &rf);
++	queued = task_on_rq_queued(p);
++	running = task_current(rq, p);
+ 
+-	SCHED_CHANGE_BLOCK(rq, p, DEQUEUE_SAVE) {
+-		p->numa_preferred_nid = nid;
+-	}
++	if (queued)
++		dequeue_task(rq, p, DEQUEUE_SAVE);
++	if (running)
++		put_prev_task(rq, p);
+ 
++	p->numa_preferred_nid = nid;
++
++	if (queued)
++		enqueue_task(rq, p, ENQUEUE_RESTORE | ENQUEUE_NOCLOCK);
++	if (running)
++		set_next_task(rq, p);
+ 	task_rq_unlock(rq, p, &rf);
+ }
+ #endif /* CONFIG_NUMA_BALANCING */
+@@ -10226,17 +10358,23 @@ void __init sched_init(void)
+ 	int i;
+ 
+ 	/* Make sure the linker didn't screw up */
++#ifdef CONFIG_HMBIRD_SCHED
+ #ifdef CONFIG_SMP
+-	BUG_ON(!sched_class_above(&stop_sched_class, &dl_sched_class));
++	WARN_ON_ONCE(!sched_class_above(&stop_sched_class, &dl_sched_class));
++#endif
++	WARN_ON_ONCE(!sched_class_above(&dl_sched_class, &rt_sched_class));
++	WARN_ON_ONCE(!sched_class_above(&rt_sched_class, &fair_sched_class));
++	WARN_ON_ONCE(!sched_class_above(&fair_sched_class, &idle_sched_class));
++	WARN_ON_ONCE(!sched_class_above(&fair_sched_class, &hmbird_sched_class));
++	WARN_ON_ONCE(!sched_class_above(&hmbird_sched_class, &idle_sched_class));
++#else
++	BUG_ON(&idle_sched_class != &fair_sched_class + 1 ||
++	       &fair_sched_class != &rt_sched_class + 1 ||
++	       &rt_sched_class   != &dl_sched_class + 1);
++#ifdef CONFIG_SMP
++	BUG_ON(&dl_sched_class != &stop_sched_class + 1);
+ #endif
+-	BUG_ON(!sched_class_above(&dl_sched_class, &rt_sched_class));
+-	BUG_ON(!sched_class_above(&rt_sched_class, &fair_sched_class));
+-	BUG_ON(!sched_class_above(&fair_sched_class, &idle_sched_class));
+-#ifdef CONFIG_SCHED_CLASS_EXT
+-	BUG_ON(!sched_class_above(&fair_sched_class, &ext_sched_class));
+-	BUG_ON(!sched_class_above(&ext_sched_class, &idle_sched_class));
+ #endif
+-
+ 	wait_bit_init();
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+@@ -10406,8 +10544,9 @@ void __init sched_init(void)
+ 	balance_push_set(smp_processor_id(), false);
+ #endif
+ 	init_sched_fair_class();
+-	init_sched_ext_class();
+-
++#ifdef CONFIG_HMBIRD_SCHED
++	init_sched_hmbird_class();
++#endif
+ 	psi_init();
+ 
+ 	init_uclamp();
+@@ -10877,6 +11016,11 @@ static int cpu_cgroup_css_online(struct cgroup_subsys_state *css)
+ 	struct task_group *tg = css_tg(css);
+ 	struct task_group *parent = css_tg(css->parent);
+ 
++#ifdef CONFIG_HMBIRD_SCHED
++	hmbird_tg_online(tg);
++#endif
++
++
+ 	if (parent)
+ 		sched_online_group(tg, parent);
+ 
+@@ -10926,13 +11070,77 @@ static int cpu_cgroup_can_attach(struct cgroup_taskset *tset)
+ }
+ #endif
+ 
++#ifdef CONFIG_HMBIRD_SCHED
++static inline void update_cgroup_ids_table(int ids, u8 hmbird_cgroup_deadline_idx)
++{
++	if (ids < 0 || ids >= NUMS_CGROUP_KINDS) {
++		pr_err("update_cgroup_ids_tab idx err!\n");
++		return;
++	}
++	cgroup_ids_table[ids] = hmbird_cgroup_deadline_idx;
++}
++
++static int cgroup_write_hmbird_deadline(struct cgroup_subsys_state *css,
++						struct cftype *cftype, u64 dl)
++{
++	int i;
++
++	for (i = MIN_CGROUP_DL_IDX; i < MAX_GLOBAL_DSQS; ++i) {
++		if (dl < HMBIRD_BPF_DSQS_DEADLINE[i])
++			break;
++	}
++
++	i = max_t(int, i-1, MIN_CGROUP_DL_IDX);
++	if (!css || !css->cgroup || !css->cgroup->kn)
++		return 0;
++	update_cgroup_ids_table(css->cgroup->kn->id, i);
++
++	return 0;
++}
++
++static u64 cgroup_read_hmbird_deadline(struct cgroup_subsys_state *css,
++						struct cftype *cft)
++{
++	u8 i;
++
++	if (!css || !css->cgroup || !css->cgroup->kn)
++		return (u64) HMBIRD_BPF_DSQS_DEADLINE[DEFAULT_CGROUP_DL_IDX];
++	i = min_t(u8, cgroup_ids_table[css->cgroup->kn->id], MAX_GLOBAL_DSQS-1);
++	if (i < 0) {
++		pr_err("<sched_ext> <%s> i is %d, less than 0, name is %s\n",
++			__func__, i, css->cgroup->kn->name);
++		i = DEFAULT_CGROUP_DL_IDX;
++	}
++
++	return (u64) HMBIRD_BPF_DSQS_DEADLINE[i];
++}
++
++static void hmbird_change_rt_sched_prop(struct cgroup_subsys_state *css,
++						struct task_struct *p, int prio)
++{
++	if (!css || !rt_prio(prio))
++		return;
++
++	if (!(hmbird_get_sched_prop(p) & SCHED_PROP_DEADLINE_MASK)) {
++		if (!strcmp(css->cgroup->kn->name, "display"))
++			hmbird_set_sched_prop(p, SCHED_PROP_DEADLINE_LEVEL3);
++		else if (!strcmp(css->cgroup->kn->name, "touch"))
++			hmbird_set_sched_prop(p, SCHED_PROP_DEADLINE_LEVEL2);
++		else if (!strcmp(css->cgroup->kn->name, "multimedia"))
++			hmbird_set_sched_prop(p, SCHED_PROP_DEADLINE_LEVEL1);
++	}
++}
++#endif
++
+ static void cpu_cgroup_attach(struct cgroup_taskset *tset)
+ {
+ 	struct task_struct *task;
+ 	struct cgroup_subsys_state *css;
+ 
+ 	cgroup_taskset_for_each(task, css, tset) {
+-
++#ifdef CONFIG_HMBIRD_SCHED
++		hmbird_change_rt_sched_prop(css, task, task->prio);
++#endif
+ 		sched_move_task(task);
+ 	}
+ 
+@@ -11614,7 +11822,13 @@ static struct cftype cpu_legacy_files[] = {
+ 		.write_u64 = cpu_uclamp_ls_write_u64,
+ 	},
+ #endif
+-
++#ifdef CONFIG_HMBIRD_SCHED
++	{
++		.name = "hmbird.deadline",
++		.read_u64 = cgroup_read_hmbird_deadline,
++		.write_u64 = cgroup_write_hmbird_deadline,
++	},
++#endif
+ 	{ }	/* Terminate */
+ };
+ 
+@@ -11663,7 +11877,6 @@ static int cpu_local_stat_show(struct seq_file *sf,
+ }
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+-
+ static u64 cpu_weight_read_u64(struct cgroup_subsys_state *css,
+ 			       struct cftype *cft)
+ {
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index a6c99df9e..e09904f4d 100755
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -375,9 +375,8 @@ static __init int sched_init_debug(void)
+ #endif
+ 
+ 	debugfs_create_file("debug", 0444, debugfs_sched, NULL, &sched_debug_fops);
+-
+-#ifdef CONFIG_SCHED_CLASS_EXT
+-	debugfs_create_file("ext", 0444, debugfs_sched, NULL, &sched_ext_fops);
++#ifdef CONFIG_HMBIRD_SCHED
++	debugfs_create_file("hmbird", 0444, debugfs_sched, NULL, &sched_hmbird_fops);
+ #endif
+ 	return 0;
+ }
+@@ -1006,9 +1005,6 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
+ 	SEQ_printf(m,
+ 		"---------------------------------------------------------"
+ 		"----------\n");
+-#ifdef CONFIG_SLIM_SCHED
+-	SEQ_printf(m, "p->sched_prop:0x%lx\n", p->sched_prop);
+-#endif
+ 
+ #define P_SCHEDSTAT(F)  __PS(#F, schedstat_val(p->stats.F))
+ #define PN_SCHEDSTAT(F) __PSN(#F, schedstat_val(p->stats.F))
+@@ -1104,8 +1100,10 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
+ 	} else if (fair_policy(p->policy)) {
+ 		P(se.slice);
+ 	}
+-#ifdef CONFIG_SCHED_CLASS_EXT
+-	__PS("ext.enabled", p->sched_class == &ext_sched_class);
++#ifdef CONFIG_HMBIRD_SCHED
++	__PS("hmbird.enabled", p->sched_class == &hmbird_sched_class);
++	__PS("sched_prop", get_hmbird_ts(p)->sched_prop);
++	__PS("top_task_prop", get_hmbird_ts(p)->top_task_prop);
+ #endif
+ #undef PN_SCHEDSTAT
+ #undef P_SCHEDSTAT
+diff --git a/kernel/sched/idle.c b/kernel/sched/idle.c
+index b33cefeb4..487255ac6 100755
+--- a/kernel/sched/idle.c
++++ b/kernel/sched/idle.c
+@@ -408,13 +408,17 @@ static void check_preempt_curr_idle(struct rq *rq, struct task_struct *p, int fl
+ 
+ static void put_prev_task_idle(struct rq *rq, struct task_struct *prev)
+ {
+-	scx_update_idle(rq, false);
++#ifdef CONFIG_HMBIRD_SCHED
++	hmbird_update_idle(rq, false);
++#endif
+ }
+ 
+ static void set_next_task_idle(struct rq *rq, struct task_struct *next, bool first)
+ {
+ 	update_idle_core(rq);
+-	scx_update_idle(rq, true);
++#ifdef CONFIG_HMBIRD_SCHED
++	hmbird_update_idle(rq, true);
++#endif
+ 	schedstat_inc(rq->sched_goidle);
+ }
+ 
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index e09b29a9d..fa891df65 100755
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -188,18 +188,13 @@ static inline int idle_policy(int policy)
+ 	return policy == SCHED_IDLE;
+ }
+ 
+-static inline int normal_policy(int policy)
+-{
+-#ifdef CONFIG_SCHED_CLASS_EXT
+-	if (policy == SCHED_EXT)
+-		return true;
+-#endif
+-	return policy == SCHED_NORMAL;
+-}
+-
+ static inline int fair_policy(int policy)
+ {
+-	return normal_policy(policy) || policy == SCHED_BATCH;
++#ifdef CONFIG_HMBIRD_SCHED
++	return policy == SCHED_HMBIRD || policy == SCHED_NORMAL || policy == SCHED_BATCH;
++#else
++	return policy == SCHED_NORMAL || policy == SCHED_BATCH;
++#endif
+ }
+ 
+ static inline int rt_policy(int policy)
+@@ -247,24 +242,6 @@ static inline void update_avg(u64 *avg, u64 sample)
+ #define shr_bound(val, shift)							\
+ 	(val >> min_t(typeof(shift), shift, BITS_PER_TYPE(typeof(val)) - 1))
+ 
+-/*
+- * cgroup weight knobs should use the common MIN, DFL and MAX values which are
+- * 1, 100 and 10000 respectively. While it loses a bit of range on both ends, it
+- * maps pretty well onto the shares value used by scheduler and the round-trip
+- * conversions preserve the original value over the entire range.
+- */
+-static inline unsigned long sched_weight_from_cgroup(unsigned long cgrp_weight)
+-{
+-	return DIV_ROUND_CLOSEST_ULL(cgrp_weight * 1024, CGROUP_WEIGHT_DFL);
+-}
+-
+-static inline unsigned long sched_weight_to_cgroup(unsigned long weight)
+-{
+-	return clamp_t(unsigned long,
+-		       DIV_ROUND_CLOSEST_ULL(weight * CGROUP_WEIGHT_DFL, 1024),
+-		       CGROUP_WEIGHT_MIN, CGROUP_WEIGHT_MAX);
+-}
+-
+ /*
+  * !! For sched_setattr_nocheck() (kernel) only !!
+  *
+@@ -532,10 +509,12 @@ static inline void set_task_rq_fair(struct sched_entity *se,
+ 			     struct cfs_rq *prev, struct cfs_rq *next) { }
+ #endif /* CONFIG_SMP */
+ #else /* CONFIG_FAIR_GROUP_SCHED */
++#ifdef CONFIG_HMBIRD_SCHED
+ static inline int sched_group_set_shares(struct task_group *tg, unsigned long shares)
+ {
+ 	return 0;
+ }
++#endif
+ #endif /* CONFIG_FAIR_GROUP_SCHED */
+ 
+ #else /* CONFIG_CGROUP_SCHED */
+@@ -700,29 +679,6 @@ struct cfs_rq {
+ #endif /* CONFIG_FAIR_GROUP_SCHED */
+ };
+ 
+-#ifdef CONFIG_SCHED_CLASS_EXT
+-/* scx_rq->flags, protected by the rq lock */
+-enum scx_rq_flags {
+-	SCX_RQ_CAN_STOP_TICK	= 1 << 0,
+-};
+-
+-struct scx_rq {
+-	struct scx_dispatch_q	local_dsq;
+-	struct list_head	watchdog_list;
+-	u64			ops_qseq;
+-	u64			extra_enq_flags;	/* see move_task_to_local_dsq() */
+-	u32			nr_running;
+-	u32			flags;
+-	bool			cpu_released;
+-	cpumask_var_t		cpus_to_kick;
+-	cpumask_var_t		cpus_to_preempt;
+-	cpumask_var_t		cpus_to_wait;
+-	u64			pnt_seq;
+-	struct irq_work		kick_cpus_irq_work;
+-	struct rq               *rq;
+-};
+-#endif /* CONFIG_SCHED_CLASS_EXT */
+-
+ static inline int rt_bandwidth_enabled(void)
+ {
+ 	return sysctl_sched_rt_runtime >= 0;
+@@ -1258,11 +1214,7 @@ struct rq {
+ 
+ 	ANDROID_OEM_DATA_ARRAY(1, 16);
+ 
+-#ifdef CONFIG_SLIM_SCHED
+-	ANDROID_KABI_USE(1, struct scx_rq *scx);
+-#else
+ 	ANDROID_KABI_RESERVE(1);
+-#endif
+ 	ANDROID_KABI_RESERVE(2);
+ 	ANDROID_KABI_RESERVE(3);
+ 	ANDROID_KABI_RESERVE(4);
+@@ -2340,11 +2292,6 @@ struct affinity_context {
+ 	unsigned int flags;
+ };
+ 
+-enum rq_onoff_reason {
+-	RQ_ONOFF_HOTPLUG,               /* CPU is going on/offline */
+-	RQ_ONOFF_TOPOLOGY,              /* sched domain topology update */
+-};
+-
+ struct sched_class {
+ 
+ #ifdef CONFIG_UCLAMP_TASK
+@@ -2551,7 +2498,6 @@ extern void init_sched_rt_class(void);
+ extern void init_sched_fair_class(void);
+ 
+ extern void reweight_task(struct task_struct *p, int prio);
+-extern void __setscheduler_prio(struct task_struct *p, int prio);
+ 
+ extern void resched_curr(struct rq *rq);
+ extern void resched_cpu(int cpu);
+@@ -2632,53 +2578,6 @@ static inline void sub_nr_running(struct rq *rq, unsigned count)
+ extern void activate_task(struct rq *rq, struct task_struct *p, int flags);
+ extern void deactivate_task(struct rq *rq, struct task_struct *p, int flags);
+ 
+-struct sched_change_guard {
+-	struct task_struct	*p;
+-	struct rq		*rq;
+-	bool			queued;
+-	bool			running;
+-	bool			done;
+-};
+-
+-extern struct sched_change_guard
+-sched_change_guard_init(struct rq *rq, struct task_struct *p, int flags);
+-
+-extern void sched_change_guard_fini(struct sched_change_guard *cg, int flags);
+-
+-/**
+- * SCHED_CHANGE_BLOCK - Nested block for task attribute updates
+- * @__rq: Runqueue the target task belongs to
+- * @__p: Target task
+- * @__flags: DEQUEUE/ENQUEUE_* flags
+- *
+- * A task may need to be dequeued and put_prev_task'd for attribute updates and
+- * set_next_task'd and re-enqueued afterwards. This helper defines a nested
+- * block which automatically handles these preparation and cleanup operations.
+- *
+- *  SCHED_CHANGE_BLOCK(rq, p, DEQUEUE_SAVE | DEQUEUE_NOCLOCK) {
+- *	  update_attribute(p);
+- *        ...
+- *  }
+- *
+- * If @__flags is a variable, the variable may be updated in the block body and
+- * the updated value will be used when re-enqueueing @p.
+- *
+- * If %DEQUEUE_NOCLOCK is specified, the caller is responsible for calling
+- * update_rq_clock() beforehand. Otherwise, the rq clock is automatically
+- * updated iff the task needs to be dequeued and re-enqueued. Only the former
+- * case guarantees that the rq clock is up-to-date inside and after the block.
+- */
+-#define SCHED_CHANGE_BLOCK(__rq, __p, __flags)					\
+-	for (struct sched_change_guard __cg =					\
+-			sched_change_guard_init(__rq, __p, __flags);		\
+-	     !__cg.done; sched_change_guard_fini(&__cg, __flags))
+-
+-extern void check_class_changing(struct rq *rq, struct task_struct *p,
+-				 const struct sched_class *prev_class);
+-extern void check_class_changed(struct rq *rq, struct task_struct *p,
+-				const struct sched_class *prev_class,
+-				int oldprio);
+-
+ extern void check_preempt_curr(struct rq *rq, struct task_struct *p, int flags);
+ 
+ #ifdef CONFIG_PREEMPT_RT
+@@ -3708,6 +3607,8 @@ static inline bool cpu_busy_with_softirqs(int cpu)
+ }
+ #endif /* CONFIG_RT_SOFTIRQ_AWARE_SCHED */
+ 
+-#include "ext.h"
++#ifdef CONFIG_HMBIRD_SCHED
++#include "hmbird.h"
++#endif
+ 
+ #endif /* _KERNEL_SCHED_SCHED_H */
+diff --git a/kernel/time/tick-sched.c b/kernel/time/tick-sched.c
+index 998c2eefe..c13772ee8 100755
+--- a/kernel/time/tick-sched.c
++++ b/kernel/time/tick-sched.c
+@@ -34,6 +34,10 @@
+ 
+ #include <trace/events/timer.h>
+ 
++#ifdef CONFIG_HMBIRD_SCHED
++#include "../sched/hmbird/hmbird_shadow_tick.h"
++#endif
++
+ /*
+  * Per-CPU nohz control structure
+  */
+@@ -1124,6 +1128,9 @@ void tick_nohz_idle_stop_tick(void)
+ 	ktime_t expires;
+ 
+ 	trace_android_vh_tick_nohz_idle_stop_tick(NULL);
++#ifdef CONFIG_HMBIRD_SCHED
++	android_vh_tick_nohz_idle_stop_tick_handler(NULL,NULL);
++#endif
+ 	/*
+ 	 * If tick_nohz_get_sleep_length() ran tick_nohz_next_event(), the
+ 	 * tick timer expiration time is known already.

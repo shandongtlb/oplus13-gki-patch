@@ -1,0 +1,334 @@
+From 35ae1bd04e53ac963c00e5889c3ffd141c9a2334 Mon Sep 17 00:00:00 2001
+From: shandongtlb <40312509+shandongtlb@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 17:41:16 +0000
+Subject: [PATCH 05/22] sched/hmbird: recover stock fatal timeout and extreme
+ load paths
+
+Recover DSQ byte89, ordinary/fatal deadlines, scan transitions and consumption ordering from the supplied stock Image. Preserve local/global fast paths and add the confirmed extreme-load rescue conditions.
+
+Evidence: stock-parity/reverse/fatal-timeout-analysis and fatal-timeout-candidate. ARM64 build_policy and dependent selected objects pass; no linked Image or runtime parity claim.
+---
+ include/linux/sched/hmbird.h |   1 +
+ kernel/sched/hmbird/hmbird.c | 162 +++++++++++++++++++++++++++--------
+ 2 files changed, 125 insertions(+), 38 deletions(-)
+
+diff --git a/include/linux/sched/hmbird.h b/include/linux/sched/hmbird.h
+index da427a12c..c00b81334 100755
+--- a/include/linux/sched/hmbird.h
++++ b/include/linux/sched/hmbird.h
+@@ -114,6 +114,7 @@ struct hmbird_dispatch_q {
+ 	struct rcu_head		rcu;
+ 	u64                     last_consume_at;
+ 	bool                    is_timeout;
++	bool                    is_fatal_timeout;
+ };
+ 
+ /* hmbird_entity.flags */
+diff --git a/kernel/sched/hmbird/hmbird.c b/kernel/sched/hmbird/hmbird.c
+index 3b6d5d299..f8a17a328 100644
+--- a/kernel/sched/hmbird/hmbird.c
++++ b/kernel/sched/hmbird/hmbird.c
+@@ -170,8 +170,14 @@ static bool __cacheline_aligned_in_smp hmbird_has_idle_cpus;
+ /* dispatch queues */
+ static struct hmbird_dispatch_q __cacheline_aligned_in_smp hmbird_dsq_global;
+ 
+-u32 HMBIRD_BPF_DSQS_DEADLINE[MAX_GLOBAL_DSQS] = {0, 1, 2, 4, 6, 8, 16, 32, 64, 128};
++u32 HMBIRD_BPF_DSQS_DEADLINE[MAX_GLOBAL_DSQS] = {0, 1, 2, 4, 8, 12, 16, 32, 64, 128};
++u32 HMBIRD_BPF_FATAL_DEADLINE[MAX_GLOBAL_DSQS] = {
++	30, 50, 50, 50, 100, 150, 180, 250, 200, 500
++};
+ u32 pcp_dsq_deadline = 20;
++u32 pcp_fatal_deadline = 150;
++static bool extreme_load_mode;
++static unsigned long last_extrem_load_mode;
+ static struct hmbird_dispatch_q __cacheline_aligned_in_smp gdsqs[MAX_GLOBAL_DSQS];
+ static DEFINE_PER_CPU(struct hmbird_dispatch_q, pcp_ldsq);
+ 
+@@ -969,33 +975,41 @@ static int consume_ux_dsq(struct rq *rq, struct rq_flags *rf)
+ 	return 0;
+ }
+ 
+-static void update_timeout_stats(struct rq *rq, struct hmbird_dispatch_q *dsq, u64 deadline)
++static void update_timeout_stats(struct rq *rq, struct hmbird_dispatch_q *dsq,
++				u64 deadline, u64 fatal_deadline)
+ {
+ 	struct hmbird_entity *entity;
+ 	unsigned long flags;
++	int timeout;
+ 
+ 	raw_spin_lock_irqsave(&dsq->lock, flags);
++	if (!dsq->is_timeout && !dsq->is_fatal_timeout)
++		goto unlock;
+ 	if (list_empty(&dsq->fifo))
+ 		goto clear_timeout;
+ 
+ 	entity = list_first_entry(&dsq->fifo, struct hmbird_entity, dsq_node.fifo);
+-	if (time_before_eq(jiffies, entity->runnable_at + msecs_to_jiffies(deadline)))
+-		goto clear_timeout;
+-
+-	raw_spin_unlock_irqrestore(&dsq->lock, flags);
+-	hmbird_info_trace(
+-				"dsq[%d] still timeout task-%s, jiffies = %lu, deadline = %lu, runnable at = %lu\n",
+-				dsq_id_to_internal(dsq), entity->task->comm,
+-				jiffies, msecs_to_jiffies(deadline), entity->runnable_at);
+-	hmbird_info_systrace("C|9999|dsq_%d_timeout|%d\n", dsq_id_to_internal(dsq), 1);
+-	return;
++	if (time_after(jiffies, entity->runnable_at + msecs_to_jiffies(fatal_deadline))) {
++		timeout = 2;
++		goto still_timeout;
++	}
++	dsq->is_fatal_timeout = false;
++	if (time_after(jiffies, entity->runnable_at + msecs_to_jiffies(deadline))) {
++		timeout = 1;
++		goto still_timeout;
++	}
+ 
+ clear_timeout:
+-	hmbird_info_trace("dsq[%d] clear timeout\n",
+-				dsq_id_to_internal(dsq));
+-	hmbird_info_systrace("C|9999|dsq_%d_timeout|%d\n", dsq_id_to_internal(dsq), 0);
+ 	dsq->is_timeout = false;
++	dsq->is_fatal_timeout = false;
++	raw_spin_unlock_irqrestore(&dsq->lock, flags);
++	hmbird_info_systrace("C|9999|dsq_%d_timeout|%d\n", dsq_id_to_internal(dsq), 0);
+ 	slim_stats_record(PCP_TIMEOUT_CNT, 0, 0, cpu_of(rq));
++	return;
++
++still_timeout:
++	hmbird_info_systrace("C|9999|dsq_%d_timeout|%d\n", dsq_id_to_internal(dsq), timeout);
++unlock:
+ 	raw_spin_unlock_irqrestore(&dsq->lock, flags);
+ }
+ 
+@@ -1027,7 +1041,7 @@ static int consume_pcp_dsq(struct rq *rq, struct rq_flags *rf, bool any)
+ 		if (is_timeout) {
+ 			hmbird_info_trace("dsq[%d] consume a pcp timeout task\n",
+ 						dsq_id_to_internal(dsq));
+-			update_timeout_stats(rq, dsq, pcp_dsq_deadline);
++			update_timeout_stats(rq, dsq, pcp_dsq_deadline, pcp_fatal_deadline);
+ 			slim_stats_record(PCP_TIMEOUT_CNT, 0, 0, cpu);
+ 		}
+ 		slim_stats_record(PCP_LDSQ_CNT, 1, 0, cpu);
+@@ -1171,6 +1185,17 @@ static int consume_timeout_dsq(struct rq *rq, struct rq_flags *rf, enum cpu_type
+ 	if (gen_cluster_ctx(&ctx, type))
+ 		return 0;
+ 
++	/* Stock checks the UX queue before PCP and the cluster's ordinary queues. */
++	raw_spin_lock_irqsave(&gdsqs[UX_COMPATIBLE_IDX].lock, flags);
++	is_timeout = gdsqs[UX_COMPATIBLE_IDX].is_timeout;
++	raw_spin_unlock_irqrestore(&gdsqs[UX_COMPATIBLE_IDX].lock, flags);
++	if (is_timeout && consume_dispatch_q(rq, rf, &gdsqs[UX_COMPATIBLE_IDX])) {
++		update_timeout_stats(rq, &gdsqs[UX_COMPATIBLE_IDX],
++			HMBIRD_BPF_DSQS_DEADLINE[UX_COMPATIBLE_IDX],
++			HMBIRD_BPF_FATAL_DEADLINE[UX_COMPATIBLE_IDX]);
++		return 1;
++	}
++
+ 	/* Third param <false> means only consume timeout pcp dsq. */
+ 	if (consume_pcp_dsq(rq, rf, false))
+ 		return 1;
+@@ -1189,7 +1214,8 @@ static int consume_timeout_dsq(struct rq *rq, struct rq_flags *rf, enum cpu_type
+ 			if (consume_dispatch_q(rq, rf, &gdsqs[i])) {
+ 				hmbird_info_trace("dsq[%d] consume a timeout task\n", i);
+ 				slim_stats_record(TIMEOUT_CNT, ctx.tidx, 0, 0);
+-				update_timeout_stats(rq, &gdsqs[i], HMBIRD_BPF_DSQS_DEADLINE[i]);
++				update_timeout_stats(rq, &gdsqs[i],
++					HMBIRD_BPF_DSQS_DEADLINE[i], HMBIRD_BPF_FATAL_DEADLINE[i]);
+ 				return 1;
+ 			}
+ 		}
+@@ -1197,6 +1223,38 @@ static int consume_timeout_dsq(struct rq *rq, struct rq_flags *rf, enum cpu_type
+ 	return 0;
+ }
+ 
++static int consume_fatal_timeout_dsqs(struct rq *rq, struct rq_flags *rf)
++{
++	struct hmbird_dispatch_q *dsq = &per_cpu(pcp_ldsq, cpu_of(rq));
++	u64 deadline = pcp_dsq_deadline;
++	u64 fatal_deadline = pcp_fatal_deadline;
++	unsigned long flags;
++	bool fatal;
++	int i;
++
++	raw_spin_lock_irqsave(&dsq->lock, flags);
++	fatal = dsq->is_fatal_timeout;
++	raw_spin_unlock_irqrestore(&dsq->lock, flags);
++	if (fatal && consume_dispatch_q(rq, rf, dsq)) {
++		update_timeout_stats(rq, dsq, deadline, fatal_deadline);
++		return 1;
++	}
++
++	for (i = 0; i < MAX_GLOBAL_DSQS; i++) {
++		dsq = &gdsqs[i];
++		deadline = HMBIRD_BPF_DSQS_DEADLINE[i];
++		fatal_deadline = HMBIRD_BPF_FATAL_DEADLINE[i];
++		raw_spin_lock_irqsave(&dsq->lock, flags);
++		fatal = dsq->is_fatal_timeout;
++		raw_spin_unlock_irqrestore(&dsq->lock, flags);
++		if (fatal && consume_dispatch_q(rq, rf, dsq)) {
++			update_timeout_stats(rq, dsq, deadline, fatal_deadline);
++			return 1;
++		}
++	}
++	return 0;
++}
++
+ static int consume_non_period_dsq(struct rq *rq, struct rq_flags *rf, enum cpu_type type)
+ {
+ 	struct cluster_ctx ctx;
+@@ -1237,6 +1295,8 @@ static bool consume_hmbird_global_dsq(struct rq *rq, struct rq_flags *rf)
+ 
+ 	switch (type) {
+ 	case EX_FREE:
++		if (consume_fatal_timeout_dsqs(rq, rf))
++			return 1;
+ 		if (consume_period_dsq(rq, rf))
+ 			return 1;
+ 		if (consume_timeout_dsq(rq, rf, BIG))
+@@ -1255,6 +1315,8 @@ static bool consume_hmbird_global_dsq(struct rq *rq, struct rq_flags *rf)
+ 		}
+ 		break;
+ 	case EXCLUSIVE:
++		if (consume_fatal_timeout_dsqs(rq, rf))
++			return 1;
+ 		if (!is_iso_par_free()) {
+ 			if (consume_pcp_dsq(rq, rf, true))
+ 				return 1;
+@@ -1293,6 +1355,8 @@ static bool consume_hmbird_global_dsq(struct rq *rq, struct rq_flags *rf)
+ 			return 1;
+ 		break;
+ 	case PARTIAL:
++		if (consume_fatal_timeout_dsqs(rq, rf))
++			return 1;
+ 		if (!is_partial_enabled()) {
+ 			if (consume_pcp_dsq(rq, rf, true))
+ 				return 1;
+@@ -1327,6 +1391,8 @@ static bool consume_hmbird_global_dsq(struct rq *rq, struct rq_flags *rf)
+ 		break;
+ 
+ 	case BIG:
++		if (consume_fatal_timeout_dsqs(rq, rf))
++			return 1;
+ 		if (period_allowed && consume_period_dsq(rq, rf))
+ 			return 1;
+ 		if (non_period_allowed && consume_timeout_dsq(rq, rf, type))
+@@ -1335,7 +1401,7 @@ static bool consume_hmbird_global_dsq(struct rq *rq, struct rq_flags *rf)
+ 			return 1;
+ 		if (non_period_allowed && consume_non_period_dsq(rq, rf, type))
+ 			return 1;
+-		if (is_iso_par_free() || (is_little_need_rescue() &&
++		if (extreme_load_mode || is_iso_par_free() || (is_little_need_rescue() &&
+ 				!cluster_need_rescue(iso_masks.big, parctrl_high_ratio))) {
+ 			if (consume_timeout_dsq(rq, rf, LITTLE))
+ 				return 1;
+@@ -1347,6 +1413,8 @@ static bool consume_hmbird_global_dsq(struct rq *rq, struct rq_flags *rf)
+ 		break;
+ 
+ 	case LITTLE:
++		if (consume_fatal_timeout_dsqs(rq, rf))
++			return 1;
+ 		if (consume_target_dsq(rq, rf, SCHED_PROP_DEADLINE_LEVEL0))
+ 			return 1;
+ 		if (consume_target_dsq(rq, rf, SCHED_PROP_DEADLINE_LEVEL2))
+@@ -1360,7 +1428,7 @@ static bool consume_hmbird_global_dsq(struct rq *rq, struct rq_flags *rf)
+ 		if (non_period_allowed && consume_non_period_dsq(rq, rf, type))
+ 			return 1;
+ 
+-		if (is_iso_par_free() || (is_big_need_rescue() &&
++		if (extreme_load_mode || is_iso_par_free() || (is_big_need_rescue() &&
+ 			!cluster_need_rescue(iso_masks.little, parctrl_high_ratio_l))) {
+ 			if (consume_timeout_dsq(rq, rf, BIG))
+ 				return 1;
+@@ -1481,38 +1549,53 @@ static void update_dispatch_dsq_info(struct rq *rq, struct task_struct *p)
+ }
+ 
+ 
+-static bool scan_dsq_timeout(struct rq *rq, struct hmbird_dispatch_q *dsq, u64 deadline)
++static void set_extreme_load_mode(bool enable)
++{
++	if (extreme_load_mode != enable)
++		extreme_load_mode = enable;
++	if (enable)
++		last_extrem_load_mode = jiffies;
++	hmbird_internal_systrace("C|9999|extreme_load_mode|%d\n", extreme_load_mode);
++}
++
++static void scan_dsq_timeout(struct hmbird_dispatch_q *dsq,
++			     u64 deadline, u64 fatal_deadline)
+ {
+ 	struct hmbird_entity *entity;
+ 	int dsq_id;
++	int timeout = 0;
+ 
+ 	raw_spin_lock(&dsq->lock);
+-	if (list_empty(&dsq->fifo) || dsq->is_timeout) {
+-		raw_spin_unlock(&dsq->lock);
+-		return false;
++	if (list_empty(&dsq->fifo) || dsq->is_fatal_timeout) {
++		if (dsq->is_fatal_timeout)
++			set_extreme_load_mode(true);
++		goto unlock;
+ 	}
+ 
++	dsq_id = dsq_id_to_internal(dsq);
+ 	entity = list_first_entry(&dsq->fifo, struct hmbird_entity, dsq_node.fifo);
+ 	if (!entity) {
+ 		hmbird_deferred_err(SCAN_ENTITY_NULL,
+ 				"<error> : entity is NULL, dsq->id = %llu\n", dsq->id);
+-		raw_spin_unlock(&dsq->lock);
+-		return false;
++		goto unlock;
+ 	}
+ 
+-	if (time_before_eq(jiffies, entity->runnable_at + msecs_to_jiffies(deadline))) {
+-		raw_spin_unlock(&dsq->lock);
+-		return false;
++	if (time_before_eq(jiffies, entity->runnable_at + msecs_to_jiffies(deadline)))
++		goto unlock;
++
++	if (dsq_id >= UX_COMPATIBLE_IDX) {
++		dsq->is_timeout = true;
++		timeout = 1;
+ 	}
++	if (time_after(jiffies, entity->runnable_at + msecs_to_jiffies(fatal_deadline))) {
++		set_extreme_load_mode(true);
++		dsq->is_fatal_timeout = true;
++		timeout = 2;
++	}
++	hmbird_info_systrace("C|9999|dsq_%d_timeout|%d\n", dsq_id, timeout);
+ 
+-	dsq->is_timeout = true;
+-	dsq_id = dsq_id_to_internal(dsq);
+-	hmbird_info_trace("dsq[%d] has timeout task-%s, jiffies = %lu, runnable at = %lu\n",
+-			dsq_id, entity->task->comm, jiffies, entity->runnable_at);
+-	hmbird_info_systrace("C|9999|dsq_%d_timeout|%d\n", dsq_id, 1);
++unlock:
+ 	raw_spin_unlock(&dsq->lock);
+-
+-	return true;
+ }
+ 
+ void scan_timeout(struct rq *rq)
+@@ -1528,16 +1611,19 @@ void scan_timeout(struct rq *rq)
+ 	per_cpu(pcp_last_scan_at, cpu) = jiffies;
+ 
+ 	dsq = &per_cpu(pcp_ldsq, cpu);
+-	scan_dsq_timeout(rq, dsq, pcp_dsq_deadline);
++	scan_dsq_timeout(dsq, pcp_dsq_deadline, pcp_fatal_deadline);
+ 
+ 	if (time_before_eq(jiffies, (unsigned long)last_scan_at))
+ 		return;
+ 	last_scan_at = jiffies;
+ 
+-	for (i = NON_PERIOD_START; i < NON_PERIOD_END; i++) {
++	for (i = 0; i < MAX_GLOBAL_DSQS; i++) {
+ 		dsq = &gdsqs[i];
+-		scan_dsq_timeout(rq, dsq, HMBIRD_BPF_DSQS_DEADLINE[i]);
++		scan_dsq_timeout(dsq, HMBIRD_BPF_DSQS_DEADLINE[i],
++				 HMBIRD_BPF_FATAL_DEADLINE[i]);
+ 	}
++	if (extreme_load_mode && time_after(jiffies, last_extrem_load_mode + 4))
++		set_extreme_load_mode(false);
+ }
+ 
+ /*******************************Initialize***********************************/

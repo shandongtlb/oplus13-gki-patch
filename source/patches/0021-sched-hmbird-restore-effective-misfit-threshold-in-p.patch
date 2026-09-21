@@ -1,0 +1,23 @@
+From 32e4a34ceb92d4eebac087d7f8a432d50b3c5594 Mon Sep 17 00:00:00 2001
+From: shandongtlb <40312509+shandongtlb@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 18:25:44 +0000
+Subject: [PATCH 21/22] sched/hmbird: restore effective misfit threshold in
+ panic snapshot
+
+---
+ kernel/sched/hmbird/hmbird.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/kernel/sched/hmbird/hmbird.c b/kernel/sched/hmbird/hmbird.c
+index 3b12eedb6..4ef8f4334 100644
+--- a/kernel/sched/hmbird/hmbird.c
++++ b/kernel/sched/hmbird/hmbird.c
+@@ -4439,7 +4439,7 @@ static void get_hmbird_snapshot(struct panic_snapshot_t *p)
+ 	p->snap_misc.parctrl_low_ratio_l = parctrl_low_ratio_l;
+ 	p->snap_misc.isoctrl_high_ratio = isoctrl_high_ratio;
+ 	p->snap_misc.isoctrl_low_ratio = isoctrl_low_ratio;
+-	p->snap_misc.misfit_ds = misfit_ds;
++	p->snap_misc.misfit_ds = extreme_load_mode ? SCHED_CAPACITY_SCALE : misfit_ds;
+ 	p->snap_misc.partial_enable = partial_enable;
+ 	p->snap_misc.iso_free_rescue = iso_free_rescue;
+ 	p->snap_misc.isolate_ctrl = isolate_ctrl;

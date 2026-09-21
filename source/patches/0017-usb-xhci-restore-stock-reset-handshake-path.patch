@@ -1,0 +1,55 @@
+From 513adc8393854dba027dfee4040fa77324a91da7 Mon Sep 17 00:00:00 2001
+From: shandongtlb <40312509+shandongtlb@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 08:26:50 +0000
+Subject: [PATCH 17/22] usb: xhci: restore stock reset handshake path
+
+Return xhci_reset to the ordinary handshake used by stock and the matching ACK release. Remove the extra removal-state helper while preserving the full-reset hook.
+---
+ drivers/usb/host/xhci.c | 27 +--------------------------
+ 1 file changed, 1 insertion(+), 26 deletions(-)
+
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index 9e07e7e0a..da74e3436 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -82,29 +82,6 @@ int xhci_handshake(void __iomem *ptr, u32 mask, u32 done, u64 timeout_us)
+ 	return ret;
+ }
+ 
+-/*
+- * xhci_handshake_check_state - same as xhci_handshake but takes an additional
+- * exit_state parameter, and bails out with an error immediately when xhc_state
+- * has exit_state flag set.
+- */
+-int xhci_handshake_check_state(struct xhci_hcd *xhci, void __iomem *ptr,
+-		u32 mask, u32 done, int usec, unsigned int exit_state)
+-{
+-	u32	result;
+-	int	ret;
+-
+-	ret = readl_poll_timeout_atomic(ptr, result,
+-				(result & mask) == done ||
+-				result == U32_MAX ||
+-				xhci->xhc_state & exit_state,
+-				1, usec);
+-
+-	if (result == U32_MAX || xhci->xhc_state & exit_state)
+-		return -ENODEV;
+-
+-	return ret;
+-}
+-
+ /*
+  * Disable interrupts and begin the xHCI halting process.
+  */
+@@ -230,9 +207,7 @@ int xhci_reset(struct xhci_hcd *xhci, u64 timeout_us)
+ 
+ 	trace_android_vh_xhci_full_reset_on_remove(&full_reset);
+ 
+-	ret = xhci_handshake_check_state(xhci, &xhci->op_regs->command,
+-				CMD_RESET, 0, timeout_us,
+-				full_reset ? 0 : XHCI_STATE_REMOVING);
++	ret = xhci_handshake(&xhci->op_regs->command, CMD_RESET, 0, timeout_us);
+ 	if (ret)
+ 		return ret;
+ 

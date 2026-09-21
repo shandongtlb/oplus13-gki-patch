@@ -1,0 +1,70 @@
+From 2c513ebc019e321f08544814158d8e78bb30a08e Mon Sep 17 00:00:00 2001
+From: shandongtlb <40312509+shandongtlb@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 06:28:02 +0000
+Subject: [PATCH 15/22] erofs: restore stock mapping and submission diagnostics
+
+Remove release-tree empty I/O and mapping diagnostics and restore DBG_BUGON for the compressed read vector size check. Under the supplied stock config, z_erofs_runqueue, z_erofs_do_map_blocks and z_erofs_map_blocks_iter match all 1248 instruction words after verified relocation. No layout or configuration changes.
+---
+ fs/erofs/zdata.c | 11 +----------
+ fs/erofs/zmap.c  | 11 +----------
+ 2 files changed, 2 insertions(+), 20 deletions(-)
+
+diff --git a/fs/erofs/zdata.c b/fs/erofs/zdata.c
+index 053d89fff..5752d7256 100644
+--- a/fs/erofs/zdata.c
++++ b/fs/erofs/zdata.c
+@@ -1721,11 +1721,6 @@ static void z_erofs_submit_queue(struct z_erofs_decompress_frontend *f,
+ 			if (bio && (cur != last_pa ||
+ 				    last_bdev != mdev.m_bdev)) {
+ submit_bio_retry:
+-                                //#ifdef OPLUS_STORAGE_FS debug for bugid 7760993
+-				if (!bio->bi_iter.bi_size)
+-					WARN(1, "erofs submit empty io, bio=0x%p, bi_opf=0x%x, bi_sector=%llu\n",
+-					     bio, bio->bi_opf, bio->bi_iter.bi_sector);
+-                                //#endif
+ 				submit_bio(bio);
+ 				if (memstall) {
+ 					psi_memstall_leave(&pflags);
+@@ -1754,11 +1749,7 @@ static void z_erofs_submit_queue(struct z_erofs_decompress_frontend *f,
+ 
+ 			if (cur + bvec.bv_len > end)
+ 				bvec.bv_len = end - cur;
+-			//#ifdef OPLUS_STORAGE_FS debug for bugid 7760993.origin code is DBG_BUGON
+-			BUG_ON(bvec.bv_len < sb->s_blocksize);
+-			//#else
+-			//DBG_BUGON(bvec.bv_len < sb->s_blocksize);
+-			//#endif
++			DBG_BUGON(bvec.bv_len < sb->s_blocksize);
+ 			if (!bio_add_page(bio, bvec.bv_page, bvec.bv_len,
+ 					  bvec.bv_offset))
+ 				goto submit_bio_retry;
+diff --git a/fs/erofs/zmap.c b/fs/erofs/zmap.c
+index e169ca5c7..76566c2cb 100644
+--- a/fs/erofs/zmap.c
++++ b/fs/erofs/zmap.c
+@@ -393,9 +393,6 @@ static int z_erofs_get_extent_compressedlen(struct z_erofs_maprecorder *m,
+ 	}
+ out:
+ 	map->m_plen = erofs_pos(sb, m->compressedblks);
+-	//#ifdef OPLUS_STORAGE_FS debug for bugid 7760993
+-        WARN(!map->m_plen, "m_plen is 0 in out compressedblks:%u\n", m->compressedblks);
+-	//#endif
+ 	return 0;
+ err_bonus_cblkcnt:
+ 	erofs_err(sb, "bogus CBLKCNT @ lcn %lu of nid %llu", lcn, vi->nid);
+@@ -727,14 +724,8 @@ int z_erofs_map_blocks_iter(struct inode *inode, struct erofs_map_blocks *map,
+ 
+ 	err = z_erofs_do_map_blocks(inode, map, flags);
+ out:
+-        if (err){
+-		//#ifdef OPLUS_STORAGE_FS debug for bugid 7760993
+-		erofs_err(inode->i_sb,"m_la %llu m_pa %llu m_llen %llu m_plen %llu m_flags 0%o err %d",
+-		   map->m_la, map->m_pa,
+-		   map->m_llen, map->m_plen, map->m_flags,err);
+-                //#endif
++	if (err)
+ 		map->m_llen = 0;
+-	}
+ 	trace_z_erofs_map_blocks_iter_exit(inode, map, flags, err);
+ 	return err;
+ }

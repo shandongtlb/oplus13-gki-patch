@@ -1,0 +1,297 @@
+From 550bee8c2b1664ee42a07e0472a0dcbd11b8da62 Mon Sep 17 00:00:00 2001
+From: shandongtlb <40312509+shandongtlb@users.noreply.github.com>
+Date: Fri, 18 Sep 2026 17:41:16 +0000
+Subject: [PATCH 07/22] sched/hmbird: recover stock cluster uclamp and switch
+ QoS
+
+Restore topology-cluster UCLAMP_MIN aggregation, common cpufreq notification encoding, uclamp_ctrl proc entry and temporary FREQ_QOS_MIN requests around scheduler switches.
+
+Preserve stock ordering, post-unlock aggregate reread, current CPU reread during QoS removal, ignored add return and cluster reset boundaries. Evidence: uclamp-qos-analysis and lifecycle-analysis; selected ARM64 objects and extracted-helper state checks pass. No vendor implementation changes or runtime equivalence claim.
+---
+ kernel/sched/hmbird/hmbird.c            | 158 +++++++++++++++++++++++-
+ kernel/sched/hmbird/hmbird_sched_proc.c |   5 +
+ 2 files changed, 160 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/sched/hmbird/hmbird.c b/kernel/sched/hmbird/hmbird.c
+index 2a64686d6..5300bef31 100644
+--- a/kernel/sched/hmbird/hmbird.c
++++ b/kernel/sched/hmbird/hmbird.c
+@@ -11,6 +11,7 @@
+ 
+ #include <linux/notifier.h>
+ #include <linux/panic_notifier.h>
++#include <linux/arch_topology.h>
+ 
+ #include "slim.h"
+ #include "hmbird_sched.h"
+@@ -37,6 +38,139 @@ enum hmbird_ops_enable_state {
+ 	HMBIRD_OPS_DISABLED,
+ };
+ 
++#define HMBIRD_MAX_CLUSTERS 5
++
++struct hmbird_sched_cluster {
++	struct cpumask cpus;
++	u32 id;
++	u32 uclamp_min;
++	spinlock_t lock;
++};
++
++static struct hmbird_sched_cluster hmbird_cluster[HMBIRD_MAX_CLUSTERS];
++static unsigned int hmbird_nr_clusters;
++static unsigned int hmbird_cpu_uclamp_min[NR_CPUS];
++static DEFINE_PER_CPU(bool, hmbird_cpu_uclamp_min_valid);
++static bool hmbird_build_clusters_done;
++
++static void hmbird_build_clusters(void)
++{
++	unsigned int cpu, id;
++
++	if (hmbird_build_clusters_done) {
++		for_each_possible_cpu(cpu)
++			hmbird_cpu_uclamp_min[cpu] = 0;
++		for (id = 0; id < hmbird_nr_clusters; id++)
++			hmbird_cluster[id].uclamp_min = 0;
++		return;
++	}
++
++	memset(hmbird_cluster, 0, sizeof(hmbird_cluster));
++	for_each_possible_cpu(cpu) {
++		id = topology_cluster_id(cpu);
++		if (id >= HMBIRD_MAX_CLUSTERS)
++			break;
++		cpumask_set_cpu(cpu, &hmbird_cluster[id].cpus);
++	}
++	for (id = 0; id < HMBIRD_MAX_CLUSTERS; id++) {
++		if (cpumask_empty(&hmbird_cluster[id].cpus))
++			break;
++		hmbird_cluster[id].id = id;
++		spin_lock_init(&hmbird_cluster[id].lock);
++		hmbird_nr_clusters++;
++	}
++	hmbird_build_clusters_done = true;
++}
++
++static void hmbird_uclamp_inc(struct rq *rq, struct task_struct *p)
++{
++	unsigned int cpu = cpu_of(rq), id, value;
++	struct hmbird_sched_cluster *cluster;
++
++	if (!uclamp_ctrl)
++		return;
++	value = p->uclamp_req[UCLAMP_MIN].value;
++	if (!value)
++		return;
++	id = topology_cluster_id(cpu);
++	if (id >= hmbird_nr_clusters)
++		return;
++	per_cpu(hmbird_cpu_uclamp_min_valid, cpu) = true;
++	hmbird_cpu_uclamp_min[cpu] = value;
++	hmbird_info_systrace("C|9999|Cpu_%d_uclamp_min|%u\n", cpu, value);
++	cluster = &hmbird_cluster[id];
++	spin_lock(&cluster->lock);
++	if (cluster->uclamp_min < value) {
++		cluster->uclamp_min = value;
++		spin_unlock(&cluster->lock);
++		/* Stock common callback encoding; original flag name is unknown. */
++		cpufreq_update_util(rq, BIT(27) | (cluster->uclamp_min & 0x7ff));
++	} else {
++		spin_unlock(&cluster->lock);
++	}
++}
++
++static void hmbird_uclamp_dec(struct rq *rq, struct task_struct *p)
++{
++	unsigned int cpu = cpu_of(rq), id, i, value = 0;
++	struct hmbird_sched_cluster *cluster;
++
++	if (!uclamp_ctrl)
++		return;
++	id = topology_cluster_id(cpu);
++	if (id >= hmbird_nr_clusters || !per_cpu(hmbird_cpu_uclamp_min_valid, cpu))
++		return;
++	per_cpu(hmbird_cpu_uclamp_min_valid, cpu) = false;
++	hmbird_cpu_uclamp_min[cpu] = 0;
++	hmbird_info_systrace("C|9999|Cpu_%d_uclamp_min|%u\n", cpu, 0);
++	cluster = &hmbird_cluster[id];
++	spin_lock(&cluster->lock);
++	for_each_cpu(i, &cluster->cpus)
++		value = max(value, hmbird_cpu_uclamp_min[i]);
++	if (cluster->uclamp_min > value) {
++		cluster->uclamp_min = value;
++		spin_unlock(&cluster->lock);
++		cpufreq_update_util(rq, BIT(27) | (cluster->uclamp_min & 0x7ff));
++	} else {
++		spin_unlock(&cluster->lock);
++	}
++}
++
++unsigned int hmbird_add_max_freq_qos_req(int cpu, struct freq_qos_request *req)
++{
++	struct cpufreq_policy *policy;
++	unsigned int saved_min_freq = 0;
++
++	if (cpu < 0)
++		cpu = smp_processor_id();
++	policy = cpufreq_cpu_get(cpu);
++	if (policy) {
++		saved_min_freq = policy->min;
++		freq_qos_add_request(&policy->constraints, req, FREQ_QOS_MIN, policy->max);
++		policy->min = policy->max;
++		cpufreq_update_policy(cpu);
++		cpufreq_cpu_put(policy);
++	}
++	return saved_min_freq;
++}
++
++void hmbird_remove_max_freq_qos_req(int cpu, unsigned int saved_min_freq,
++				  struct freq_qos_request *req)
++{
++	struct cpufreq_policy *policy;
++
++	if (cpu < 0)
++		cpu = smp_processor_id();
++	policy = cpufreq_cpu_get(cpu);
++	if (policy) {
++		policy->min = saved_min_freq;
++		cpufreq_update_policy(cpu);
++		cpufreq_cpu_put(policy);
++	}
++	if (freq_qos_request_active(req))
++		freq_qos_remove_request(req);
++}
++
+ static inline void put_hmbird_ts(struct task_struct *p)
+ {
+ 	kfree((void *)p->android_oem_data1[HMBIRD_TS_IDX]);
+@@ -2283,8 +2417,10 @@ static void dequeue_task_hmbird(struct rq *rq, struct task_struct *p, int deq_fl
+ 	ops_dequeue(p, deq_flags);
+ 
+ 	if (slim_walt_ctrl) {
+-		if (task_current(rq, p))
++		if (task_current(rq, p)) {
+ 			hmbird_update_task_ravg_rqclock_wrapper(p, rq, PUT_PREV_TASK);
++			hmbird_uclamp_dec(rq, p);
++		}
+ 	}
+ 
+ 	if (deq_flags & HMBIRD_DEQ_SLEEP)
+@@ -2695,8 +2831,10 @@ static void set_next_task_hmbird(struct rq *rq, struct task_struct *p, bool firs
+ 	p->se.exec_start = rq_clock_task(rq);
+ 
+ 	if (slim_walt_ctrl) {
+-		if (test_bit(ffs(HMBIRD_TASK_QUEUED), (unsigned long *)&get_hmbird_ts(p)->flags))
++		if (test_bit(ffs(HMBIRD_TASK_QUEUED), (unsigned long *)&get_hmbird_ts(p)->flags)) {
+ 			hmbird_update_task_ravg_rqclock_wrapper(p, rq, PICK_NEXT_TASK);
++			hmbird_uclamp_inc(rq, p);
++		}
+ 	}
+ 
+ 	watchdog_unwatch_task(p, true);
+@@ -2726,8 +2864,10 @@ static void put_prev_task_hmbird(struct rq *rq, struct task_struct *p)
+ 	update_dispatch_dsq_info(rq, p);
+ 
+ 	if (slim_walt_ctrl) {
+-		if (test_bit(ffs(HMBIRD_TASK_QUEUED), (unsigned long *)&get_hmbird_ts(p)->flags))
++		if (test_bit(ffs(HMBIRD_TASK_QUEUED), (unsigned long *)&get_hmbird_ts(p)->flags)) {
+ 			hmbird_update_task_ravg_rqclock_wrapper(p, rq, PUT_PREV_TASK);
++			hmbird_uclamp_dec(rq, p);
++		}
+ 	}
+ 
+ 	slim_trace_show_cpu_consume_dsq_idx(smp_processor_id(), 0);
+@@ -3734,8 +3874,11 @@ static void hmbird_ops_disable_workfn(struct kthread_work *work)
+ {
+ 	struct hmbird_task_iter sti;
+ 	struct task_struct *p;
++	struct freq_qos_request req = {};
++	unsigned int saved_min_freq;
+ 	int cpu;
+ 
++	saved_min_freq = hmbird_add_max_freq_qos_req(-1, &req);
+ 	hmbird_switch_log(HMBIRD_SWITCH_PREP, 0, 0, "");
+ 	cancel_delayed_work_sync(&hmbird_watchdog_work);
+ 
+@@ -3747,6 +3890,7 @@ static void hmbird_ops_disable_workfn(struct kthread_work *work)
+ 		hmbird_switch_log(HMBIRD_DISABLED, 0, 0, "already disabled");
+ 		scheduler_switch_done(false);
+ 		mutex_unlock(&hmbird_ops_enable_mutex);
++		hmbird_remove_max_freq_qos_req(-1, saved_min_freq, &req);
+ 		return;
+ 	case HMBIRD_OPS_PREPPING:
+ 		fallthrough;
+@@ -3814,6 +3958,7 @@ static void hmbird_ops_disable_workfn(struct kthread_work *work)
+ 	hmbird_switch_log(HMBIRD_DISABLED, 1, 0, "");
+ 	scheduler_switch_done(false);
+ 	reenable_cpuhp();
++	hmbird_remove_max_freq_qos_req(-1, saved_min_freq, &req);
+ }
+ 
+ static DEFINE_KTHREAD_WORK(hmbird_ops_disable_work, hmbird_ops_disable_workfn);
+@@ -3904,6 +4049,8 @@ static int hmbird_ops_enable(void *unused)
+ {
+ 	struct hmbird_task_iter sti;
+ 	struct task_struct *p;
++	struct freq_qos_request req = {};
++	unsigned int saved_min_freq;
+ 	int ret;
+ 	int tcnt = 0;
+ 	unsigned long long start = 0;
+@@ -3912,8 +4059,10 @@ static int hmbird_ops_enable(void *unused)
+ 		hmbird_switch_log(HMBIRD_DISABLED, 0, 1, "cpu offline");
+ 		return -EBUSY;
+ 	}
++	saved_min_freq = hmbird_add_max_freq_qos_req(-1, &req);
+ 	hmbird_switch_log(HMBIRD_SWITCH_PREP, 0, 1, "");
+ 	mutex_lock(&hmbird_ops_enable_mutex);
++	hmbird_build_clusters();
+ 
+ 	if (!hmbird_ops_helper) {
+ 		WRITE_ONCE(hmbird_ops_helper,
+@@ -4048,6 +4197,7 @@ static int hmbird_ops_enable(void *unused)
+ 	mutex_unlock(&hmbird_ops_enable_mutex);
+ 	hmbird_switch_log(HMBIRD_ENABLED, 1, 1, "");
+ 	scheduler_switch_done(true);
++	hmbird_remove_max_freq_qos_req(-1, saved_min_freq, &req);
+ 
+ 	return 0;
+ 
+@@ -4055,6 +4205,7 @@ static int hmbird_ops_enable(void *unused)
+ 	mutex_unlock(&hmbird_ops_enable_mutex);
+ 	hmbird_switch_log(HMBIRD_DISABLED, 0, 1, "err_unlock");
+ 	scheduler_switch_done(false);
++	hmbird_remove_max_freq_qos_req(-1, saved_min_freq, &req);
+ 	return ret;
+ 
+ err_disable_unlock:
+@@ -4067,6 +4218,7 @@ static int hmbird_ops_enable(void *unused)
+ 	kthread_flush_work(&hmbird_ops_disable_work);
+ 	hmbird_switch_log(HMBIRD_DISABLED, 0, 1, "err_disable");
+ 	scheduler_switch_done(false);
++	hmbird_remove_max_freq_qos_req(-1, saved_min_freq, &req);
+ 	return ret;
+ }
+ 
+diff --git a/kernel/sched/hmbird/hmbird_sched_proc.c b/kernel/sched/hmbird/hmbird_sched_proc.c
+index 5469b76b5..c8ba1a583 100644
+--- a/kernel/sched/hmbird/hmbird_sched_proc.c
++++ b/kernel/sched/hmbird/hmbird_sched_proc.c
+@@ -52,6 +52,7 @@ u64 cpu_cluster_masks;
+ int hmbird_preempt_policy;
+ int light_preiod_thres = 100;
+ int cluster_separate;
++int uclamp_ctrl;
+ 
+ char saved_gov[NR_CPUS][MAX_GOV_LEN];
+ 
+@@ -639,6 +640,10 @@ static int __init hmbird_proc_init(void)
+ 					hmbird_dir,
+ 					&hmbird_common_proc_ops,
+ 					&cluster_separate);
++	HMBIRD_CREATE_PROC_ENTRY_DATA("uclamp_ctrl", HMBIRD_PROC_PERMISSION,
++					hmbird_dir,
++					&hmbird_common_proc_ops,
++					&uclamp_ctrl);
+ 
+ 	return 0;
+ }
