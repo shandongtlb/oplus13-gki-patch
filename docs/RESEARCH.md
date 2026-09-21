@@ -17,3 +17,5 @@ F2FS 的范围来自实际编译的 23 个对象，包含局部函数和 trace �
 随后切回候选，notes、BTF 和配置实采匹配，`!migration_pending` 再次出现在文件访问检查、FUSE lookup / BPF、`migrate_enable` 路径。辅助日志仅确认一次启用和一次关闭 finished，用户反馈重进正常；这些正常操作不能消除告警。两段120秒候选 probe 均为0 hit、0 miss并已清理，但告警与 probe 的精确时间关系尚未证明，不能直接判定发生在探针间隙。stock 的有限对照及120秒 probe 尚未命中此迁移异常，第二次重进也未被 stock probe 完整覆盖。此前 class、亲和性、pending 历史和根因仍待证，既不能据此认定候选独有，也不能一并关闭两类问题；没有新增修复或隐藏警告。
 
 22 封补丁已逐步重放并核对每一步完整源码 tree。提交 ID 包含作者、提交者及时间等信息，重新应用后可能变化；文件内容和模式按 [README](../README.md) 给出的目标 tree 核对。tree 一致仍不能代替构建身份或运行验证，有限对照也不证明全内核等价；个人原始日志和设备备份不随本说明发布。
+
+迁移 pending 的后续专项审计补查了 stopper、迁移/setter、FUSE lookup、网络 BPF 与 RCU 包围函数，11个完整函数共1124词，1091词直接对应，31词同名调用映射，2词相同字符串地址映射。相关 metadata 另核对，pending store→load 和 migrate_disable→migrate_enable 负对照均拒绝。正常抢占可发生在 migrate_disable 自身返回之前，FUSE 后续 backing I/O 不在该次 BPF pin 区间内。新增异 rq stopper 根据临时 cpus_ptr 提前完成请求的条件链，独立阅读未发现锁序能必然排除，但尚无现场轨迹；stock 对应路径同在，不以源码可达性代替真实复现，也不据此修改官方策略。采集站点/once 顺序已经排除错选解释，下一次须补设备侧实际 arm 与时间边界，并在异常清 pending 前捕获普通 mask、临时 mask 和任务身份。此轮只有离线研究，22个补丁保持不变。
