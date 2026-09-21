@@ -21,7 +21,7 @@ python3 scripts/recover_kallsyms.py \
 ```bash
 python3 scripts/extract_stock_exports.py \
   --image local/stock/Image --kallsyms local/symbols/kallsyms.json \
-  --config local/stock/kernel.config --source /path/to/common \
+  --config local/stock/kernel.config --source /path/to/kernel_platform/common \
   --output local/stock-exports.json
 ```
 

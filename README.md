@@ -6,13 +6,15 @@
 
 适用官方源码：[OnePlusOSS/android_kernel_common_oneplus_sm8750](https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8750)。
 
-在干净的 common 源码仓库中，从以下基线新建分支，再按文件名顺序应用：
+在包含 `kernel_platform/` 的工程根目录执行，目标 `kernel_platform/common` 必须是干净的 common Git 仓库。从以下基线新建分支，再按文件名顺序应用；将 `/path/to/oplus13-gki-patch` 替换为补丁仓库的实际绝对路径：
 
 ```bash
-git switch -c stock-recreation e1b346b6b4f4096eb342ae3684838a942fd6f6c4
-git am --keep-cr /path/to/oplus13-gki-patch/source/patches/*.patch
-git rev-parse 'HEAD^{tree}'
+git -C kernel_platform/common switch -c stock-recreation e1b346b6b4f4096eb342ae3684838a942fd6f6c4
+git -C kernel_platform/common am --keep-cr /path/to/oplus13-gki-patch/source/patches/*.patch
+git -C kernel_platform/common rev-parse 'HEAD^{tree}'
 ```
+
+补丁内部的文件路径相对于 common 仓库根目录；`-C kernel_platform/common` 指定应用位置。若只单独克隆了 common，把该参数替换为实际源码目录即可。
 
 预期源码 tree：`7a1b84dc67bb56ccb8a39cadca40e01a44d8abbd`，与当前候选源码 `f34864787733a55f7fba20ca65eda7c674e1d43e` 相同。`--keep-cr` 保留原始补丁里的换行；Git 提交 ID 可能因提交者及时间不同而变化，按 tree 核对。
 
