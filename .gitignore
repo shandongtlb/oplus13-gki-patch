@@ -1,4 +1,4 @@
-# Only publish documentation and the complete common patch series.
+# Publish documentation, common patches and selected offline analysis scripts.
 /*
 !/.gitignore
 !/.gitattributes
@@ -12,3 +12,9 @@
 /source/patches/*
 !/source/patches/*.patch
 !/source/patches/series
+!/scripts/
+/scripts/*
+!/scripts/recover_kallsyms.py
+!/scripts/extract_stock_exports.py
+!/scripts/compare_common_type_projections.py
+!/scripts/compare_stock_function.py

@@ -1,6 +1,6 @@
 # OnePlus 13 stock GKI/common 复原补丁
 
-尽量恢复 OnePlus 13 / SM8750 官方 stock common 内核的行为、ABI 和 built-in HMBIRD/风驰调度。仓库包含 **22 个完整逆向恢复补丁及 Markdown 说明**。
+尽量恢复 OnePlus 13 / SM8750 官方 stock common 内核的行为、ABI 和 built-in HMBIRD/风驰调度。仓库包含 **22 个完整逆向恢复补丁、研究过程说明和四个离线分析脚本**。
 
 ## 应用
 
@@ -23,5 +23,7 @@ git rev-parse 'HEAD^{tree}'
 恢复内容包括 HMBIRD/common 接入、shadow tick、CPU 选择、超时、uclamp、启停与诊断，以及已确认的 block、EROFS、swap hook、xHCI 和 stock 公钥信任差异。
 
 候选已成功启动，Wi-Fi/蓝牙及王者 HMBIRD 启停做过有限验证。仍有两类 scheduler warning 待确认来源，不能称全内核等价。详见[当前状态](docs/STATUS.md)和[来源说明](docs/PROVENANCE.md)。
+
+[研究过程](docs/RESEARCH.md)记录证据方法、核对范围及未解决问题；[脚本说明](docs/SCRIPTS.md)给出符号恢复、导出 CRC、BTF 布局和函数指令比较的用法。
 
 不包含 SYSVIPC 补丁或构建入口改动，不加入第三方性能优化。镜像、原始手机日志、完整源码及构建缓存保留在本地，不上传。
