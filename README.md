@@ -24,7 +24,7 @@ git -C kernel_platform/common rev-parse 'HEAD^{tree}'
 
 恢复内容包括 HMBIRD/common 接入、shadow tick、CPU 选择、超时、uclamp、启停与诊断，以及已确认的 block、EROFS、swap hook、xHCI 和 stock 公钥信任差异。
 
-候选已成功启动，Wi-Fi/蓝牙及王者 HMBIRD 启停做过有限验证。仍有两类 scheduler warning 待确认来源，不能称全内核等价。详见[当前状态](docs/STATUS.md)和[来源说明](docs/PROVENANCE.md)。
+候选已成功启动，Wi-Fi/蓝牙及王者 HMBIRD 启停做过有限验证。恢复后的 stock 身份已实采核实；王者两次启用、两次关闭正常完成，并自然捕获到同类 rq callback 不变量警告，但调用现场与候选不同。另一类 `!migration_pending` 警告仍未在 stock 观察到，不能称全内核等价。详见[当前状态](docs/STATUS.md)和[来源说明](docs/PROVENANCE.md)。
 
 [研究过程](docs/RESEARCH.md)记录证据方法、核对范围及未解决问题；[脚本说明](docs/SCRIPTS.md)给出符号恢复、导出 CRC、BTF 布局和函数指令比较的用法。
 

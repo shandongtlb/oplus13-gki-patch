@@ -7,11 +7,14 @@
 - 以官方公开 HMBIRD 回退提交 `c7bef25f9416d6a0f87ce551be9c25729f7dae6c` 的 parent `f2223b938963c24e8ad9ac2e4491c8bb718e3eb5` 作为旧源码基线，恢复 built-in HMBIRD/common 接入。
 - 通过 stock BTF、符号、ARM64 机器码和实际构建对象，恢复了 HMBIRD 生命周期、CPU 选择、RT/超时、uclamp、shadow tick、任务生命周期以及若干 block/EROFS/MM/xHCI/cert stock 差异。
 - 22 个 common 补丁逐步 tree 重放通过；源码目标 tree 见 README。
-- 候选曾完成启动、Wi-Fi/蓝牙基本使用、王者 HMBIRD 接管与关闭/重开等有限测试；用户随后报告已经恢复 stock 内核并成功开机。该报告尚未重新读取设备身份，不能替代新的 stock 证据。
+- 候选曾完成启动、Wi-Fi/蓝牙基本使用、王者 HMBIRD 接管与关闭/重开等有限测试。
+- 2026-09-21 重新连接设备，恢复后的 stock release、notes、BTF 和配置均已实采匹配。只读王者测试记录到两次 HMBIRD 启用、两次关闭 finished；用户确认重进大厅画面与操作正常，最终息屏，采集前后为同一次启动。
 
 ## 尚未等价或待复核
 
-- 王者场景中出现过两类 scheduler warning：`!migration_pending` 和 `rq->balance_callback`。离线分析已经定位到可达的 RT pull 回调、HMBIRD 启停与迁移/队列锁生命周期，但没有证明它们是候选独有，也没有足够证据修改官方路径。stock 同代码路径存在；实际 stock 同场景复现仍未完成。
+- 候选王者场景曾出现 `rq->balance_callback` 警告。2026-09-21 第一轮 stock 测试未使用 probe，在自然启停中新增 1 条相同 `rq_pin_lock` 不变量警告，证明这一类告警并非候选独有。stock 报点在 `__schedule`，候选此前报点在 `task_rq_lock` / HMBIRD 关闭 worker。第二轮另捕获 2 条同条件警告，报点为 `android_rvh_try_to_wake_up` 和 `scheduler_tick_no_balance`，均发生在短时 probe 已结束后的关闭附近。这些 stock 现场的 callback 身份、排队者及完整因果尚未证明，不能与候选现场视为完全相同，也未据此修改或隐藏警告。
+- `!migration_pending` 在随后重新刷回的候选上再次复现，notes、BTF 和配置已核实匹配。本次调用路径为文件访问检查、FUSE lookup / BPF、`migrate_enable`；已有栈和寄存器仍不能恢复此前的 class、亲和性及 pending 历史或确定根因。两段120秒候选 probe 的 pending / callback 均为0 hit、0 miss，已清理；告警与两段 probe 的精确时间关系尚未证明，不能直接归入探针间隙。辅助日志仅确认一次启用、一次关闭 finished，用户反馈重进正常，不能写成两次完整切换。
+- stock 的有限对照仍未观察到 `!migration_pending`。第二轮120秒 stock probe 的 pending / callback 同为0 hit、0 miss，且第二次重进的首个启用样本晚于 probe 结束，不能称完整两启两停过程均未命中。有限窗口内未命中不能证明 stock 永不触发，也不能据此认定候选独有。
 - 有限运行测试不能覆盖所有 HMBIRD 并发、异常回滚、热插拔、长时间负载和调度器切换组合。
 - F2FS 只做过有限用户态读写/校验；不能据此宣称断电持久化、冷缓存、强制 GC、checkpoint 或长期写回完全等价。
 - system_dlkm 保留 stock 模块的方案通过签名、版本和依赖检查；候选运行时696个模块名称与stock相同，仍不能据此认定所有模块功能等价。

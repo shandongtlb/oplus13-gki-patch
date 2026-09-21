@@ -10,6 +10,10 @@ F2FS 的范围来自实际编译的 23 个对象，包含局部函数和 trace �
 
 确定的源码恢复整理成 22 封补丁，涵盖 HMBIRD 接入、生命周期、CPU 选择、超时、uclamp、shadow tick，以及 block、EROFS、swap hook、xHCI 和 stock 公钥信任等差异。完整构建后核对了 9003 个导出符号的 CRC 与属性、12258 个类型布局组、83 个 HMBIRD 原型和证书。上述检查限定兼容性与静态范围，运行结果另见[当前状态](STATUS.md)。
 
-候选有限实测出现两类未关闭的调度警告。`!migration_pending` 涉及任务在普通允许 CPU 集合外运行、恢复迁移时缺少 pending，此前的亲和性与迁移历史仍不完整。`rq->balance_callback` 已收敛到 RT pull 排队、HMBIRD 迭代器解锁与下一次取锁的条件窗口；正常调度出口仍会清链，现场排队者和消费顺序尚未证明。stock 对应代码也存在，不等于 stock 已实际复现，因此没有据此新增修复或隐藏警告。
+候选有限实测出现两类调度警告。`!migration_pending` 涉及任务在普通允许 CPU 集合外运行、恢复迁移时缺少 pending，此前的亲和性与迁移历史仍不完整。`rq->balance_callback` 的候选诊断捕获到 RT pull 回调，离线分析找到 HMBIRD 迭代器解锁与下一次取锁之间的可达窗口；正常调度出口仍会清链，现场排队者和消费顺序尚未证明。
 
-22 封补丁已逐步重放并核对每一步完整源码 tree。提交 ID 包含作者、提交者及时间等信息，重新应用后可能变化；文件内容和模式按 [README](../README.md) 给出的目标 tree 核对。tree 一致仍不能代替构建身份或运行验证。用户最新报告已恢复 stock 并成功开机，尚未重新读取设备核实；个人原始日志和设备备份不随本说明发布。
+2026-09-21 的 stock 对照已实采核实 release、notes、BTF 和配置；首轮王者两次启用、两次关闭均记录到 finished，用户确认重进大厅正常，最终息屏。首轮没有使用 probe，自然新增 1 条相同 `rq_pin_lock` callback 不变量警告。stock 报点为 `__schedule`，不同于候选的 `task_rq_lock` / HMBIRD 关闭 worker；第二轮在 probe 结束后的关闭附近另观察到两个 owner 的同条件告警，详见[当前状态](STATUS.md)。这证明该类不变量告警在 stock 也会发生，但 callback 身份及完整因果仍未知。
+
+随后切回候选，notes、BTF 和配置实采匹配，`!migration_pending` 再次出现在文件访问检查、FUSE lookup / BPF、`migrate_enable` 路径。辅助日志仅确认一次启用和一次关闭 finished，用户反馈重进正常；这些正常操作不能消除告警。两段120秒候选 probe 均为0 hit、0 miss并已清理，但告警与 probe 的精确时间关系尚未证明，不能直接判定发生在探针间隙。stock 的有限对照及120秒 probe 尚未命中此迁移异常，第二次重进也未被 stock probe 完整覆盖。此前 class、亲和性、pending 历史和根因仍待证，既不能据此认定候选独有，也不能一并关闭两类问题；没有新增修复或隐藏警告。
+
+22 封补丁已逐步重放并核对每一步完整源码 tree。提交 ID 包含作者、提交者及时间等信息，重新应用后可能变化；文件内容和模式按 [README](../README.md) 给出的目标 tree 核对。tree 一致仍不能代替构建身份或运行验证，有限对照也不证明全内核等价；个人原始日志和设备备份不随本说明发布。
