@@ -7,7 +7,7 @@
 - 保留cctv reserve6/7/8布局方案，新增SYSVIPC及自动compat/sysctl，其余DroidSpaces扩展撤回。
 - 21个指定ARM64对象目标检查通过，n/y的task_struct均为4800字节，原218个字段保持；所检1945个导出CRC完全一致，savedefconfig及全部23个补丁逐步tree重放通过。
 - 之前较宽配置的实验版本中，PostgreSQL18.6的2048行数据、事务提交/回滚及三轮正常重启通过，采到实际SysV共享内存段。但DroidSpaces容器启动期间手机重启，原因未确定；用户已停止该方向，相关扩展不在本仓库补丁中。
-- 精简后的83e4d6950尚未完整构建或上机，旧实验版boot不代表本版。详见[SYSVIPC](SYSVIPC.md)。
+- 精简后的83e4d6950已于2026-09-22完成一轮空缓存完整构建（112.28秒）及boot封装；9003原导出、stock证书、96个stock系统模块签名/5208版本记录通过，最终task4800/218原字段保持。尚未上机。详见[SYSVIPC](SYSVIPC.md)。
 
 ## 已完成
 

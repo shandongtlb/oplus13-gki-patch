@@ -26,7 +26,7 @@ git -C kernel_platform/common rev-parse 'HEAD^{tree}'
 
 前 22 个恢复补丁的候选已成功启动，Wi-Fi/蓝牙及王者 HMBIRD 启停做过有限验证。rq callback 和 `!migration_pending` 两类警告随后均在 stock 对照中出现，没有为此改变官方迁移语义或隐藏警告。
 
-第 23 个补丁使用 cctv 的 reserve 6/7/8 方案，开启 SYSVIPC 并保持原 task_struct 布局。配置、选定对象和 ABI 检查通过；这个精简后的最终版本尚未完整构建或上机。不包含 DroidSpaces 扩展。详见 [SYSVIPC 说明](docs/SYSVIPC.md)、[当前状态](docs/STATUS.md)和[来源说明](docs/PROVENANCE.md)。
+第 23 个补丁使用 cctv 的 reserve 6/7/8 方案，开启 SYSVIPC 并保持原 task_struct 布局。2026-09-22 已完成一次空缓存完整构建和 boot 封装，最终 Image 的配置、布局、9003 个导出接口及 stock 模块检查通过；尚未上机。不包含 DroidSpaces 扩展。详见 [SYSVIPC 说明](docs/SYSVIPC.md)、[当前状态](docs/STATUS.md)和[来源说明](docs/PROVENANCE.md)。
 
 [研究过程](docs/RESEARCH.md)记录证据方法、核对范围及未解决问题；[脚本说明](docs/SCRIPTS.md)给出符号恢复、导出 CRC、BTF 布局和函数指令比较的用法。
 
