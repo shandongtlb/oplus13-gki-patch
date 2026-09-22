@@ -20,3 +20,4 @@
 0020-sched-hmbird-restore-stock-cluster-uclamp-initializa.patch
 0021-sched-hmbird-restore-effective-misfit-threshold-in-p.patch
 0022-sched-hmbird-restore-default-deadline-for-out-of-ran.patch
+0023-ipc-enable-System-V-IPC-while-preserving-stock-task-ABI.patch

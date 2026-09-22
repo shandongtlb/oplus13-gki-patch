@@ -1,12 +1,19 @@
 # 当前状态
 
-更新基准：common `f34864787733a55f7fba20ca65eda7c674e1d43e`，对应发布树目标 tree `7a1b84dc67bb56ccb8a39cadca40e01a44d8abbd`。
+2026-09-22 更新：common `83e4d6950a2d2fb62482e6391466d66fc8906370`，全部23个补丁目标 tree `f50f02f8976716270ecae9c58560deabd021587a`。前22个stock恢复提交截止f348；第23个只增加SYSVIPC。下面的历史stock/候选运行结果对应前22个补丁，不等于新版本已上机。
+
+## SYSVIPC 当前结果
+
+- 保留cctv reserve6/7/8布局方案，新增SYSVIPC及自动compat/sysctl，其余DroidSpaces扩展撤回。
+- 21个指定ARM64对象目标检查通过，n/y的task_struct均为4800字节，原218个字段保持；所检1945个导出CRC完全一致，savedefconfig及全部23个补丁逐步tree重放通过。
+- 之前较宽配置的实验版本中，PostgreSQL18.6的2048行数据、事务提交/回滚及三轮正常重启通过，采到实际SysV共享内存段。但DroidSpaces容器启动期间手机重启，原因未确定；用户已停止该方向，相关扩展不在本仓库补丁中。
+- 精简后的83e4d6950尚未完整构建或上机，旧实验版boot不代表本版。详见[SYSVIPC](SYSVIPC.md)。
 
 ## 已完成
 
 - 以官方公开 HMBIRD 回退提交 `c7bef25f9416d6a0f87ce551be9c25729f7dae6c` 的 parent `f2223b938963c24e8ad9ac2e4491c8bb718e3eb5` 作为旧源码基线，恢复 built-in HMBIRD/common 接入。
 - 通过 stock BTF、符号、ARM64 机器码和实际构建对象，恢复了 HMBIRD 生命周期、CPU 选择、RT/超时、uclamp、shadow tick、任务生命周期以及若干 block/EROFS/MM/xHCI/cert stock 差异。
-- 22 个 common 补丁逐步 tree 重放通过；源码目标 tree 见 README。
+- 22 个 stock 恢复补丁的静态及有限运行结果保留；包含SYSVIPC的最新源码目标 tree 见 README。
 - 候选曾完成启动、Wi-Fi/蓝牙基本使用、王者 HMBIRD 接管与关闭/重开等有限测试。
 - 2026-09-21 重新连接设备，恢复后的 stock release、notes、BTF 和配置均已实采匹配。只读王者测试记录到两次 HMBIRD 启用、两次关闭 finished；用户确认重进大厅画面与操作正常，最终息屏，采集前后为同一次启动。
 
@@ -18,7 +25,7 @@
 - 有限运行测试不能覆盖所有 HMBIRD 并发、异常回滚、热插拔、长时间负载和调度器切换组合。
 - F2FS 只做过有限用户态读写/校验；不能据此宣称断电持久化、冷缓存、强制 GC、checkpoint 或长期写回完全等价。
 - system_dlkm 保留 stock 模块的方案通过签名、版本和依赖检查；候选运行时696个模块名称与stock相同，仍不能据此认定所有模块功能等价。
-- 当前保持 `CONFIG_SYSVIPC=n`，此仓库不提供 SYSVIPC 补丁。
+- SYSVIPC已作为第23个补丁提供；最终版本的完整Image和运行验收仍待完成。
 
 ## 产物边界
 

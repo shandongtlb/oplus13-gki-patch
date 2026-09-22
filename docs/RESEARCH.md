@@ -16,6 +16,6 @@ F2FS 的范围来自实际编译的 23 个对象，包含局部函数和 trace �
 
 随后切回候选，notes、BTF 和配置实采匹配，专用 probe 在王者流程中捕获到 `__set_cpus_allowed_ptr_locked+0x4a4`：`pending=NULL`、普通 mask `0xc0`、目标 CPU6、flags4、`migration_disabled=1`。再切回 stock 并使用完全相同的控制器和流程，stock 也捕获到同一点位的现场，并在同一运行窗口实际打印 `__set_cpus_allowed_ptr_locked+0x4b0/0x640` 的 `!migration_pending` WARN；stock 字段同样为 `pending=NULL`、mask `0xc0`、目标6、flags4。两次线程和上层调用者不同，但关键状态一致，证明该告警不是候选独有。此前 class、亲和性、pending 历史和更深层根因仍未恢复；按 stock parity 目标不新增修复、不隐藏 WARN、不改变迁移语义。
 
-22 封补丁已逐步重放并核对每一步完整源码 tree。提交 ID 包含作者、提交者及时间等信息，重新应用后可能变化；文件内容和模式按 [README](../README.md) 给出的目标 tree 核对。tree 一致仍不能代替构建身份或运行验证，有限对照也不证明全内核等价；个人原始日志和设备备份不随本说明发布。
+22 封恢复补丁已逐步重放并核对每一步完整源码 tree。2026-09-22追加第23个SYSVIPC补丁后，全部23步再次核对通过；完整构建和运行证据仍按各自源码版本区分。提交 ID 包含作者、提交者及时间等信息，重新应用后可能变化；文件内容和模式按 [README](../README.md) 给出的目标 tree 核对。tree 一致仍不能代替构建身份或运行验证，有限对照也不证明全内核等价；个人原始日志和设备备份不随本说明发布。
 
 迁移 pending 的后续专项审计补查了 stopper、迁移/setter、FUSE lookup、网络 BPF 与 RCU 包围函数，11个完整函数共1124词，1091词直接对应，31词同名调用映射，2词相同字符串地址映射。相关 metadata 另核对，pending store→load 和 migrate_disable→migrate_enable 负对照均拒绝。正常抢占可发生在 migrate_disable 自身返回之前，FUSE 后续 backing I/O 不在该次 BPF pin 区间内。新增异 rq stopper 根据临时 cpus_ptr 提前完成请求的条件链，独立阅读未发现锁序能必然排除，但尚无现场轨迹；stock 对应路径同在，不以源码可达性代替真实复现，也不据此修改官方策略。采集站点/once 顺序已经排除错选解释，下一次须补设备侧实际 arm 与时间边界，并在异常清 pending 前捕获普通 mask、临时 mask 和任务身份。此轮只有离线研究，22个补丁保持不变。
